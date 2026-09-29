@@ -1,0 +1,454 @@
+### svm_core.cpp
+2: @file       svm_core.cpp
+4: @brief      SVM/NPT 虚拟化核心代码。
+6: @author     Satoshi Tanda
+8: @copyright  Copyright (c) 2017-2020, Satoshi Tanda. All rights reserved.
+43: // 参见 AMD 手册中的 2 MiB PML4E 和 PDPE 长模式格式。
+102: // 参见 AMD 手册中的长模式 GDTR/IDTR 格式。
+167: // SimpleSVM 专用结构。
+188: //  Low     HostStackLimit[0]                        StackLimit
+190: //  ^       HostStackLimit[KERNEL_STACK_SIZE - 2]    StackBase
+191: //  High    HostStackLimit[KERNEL_STACK_SIZE - 1]    StackBase
+261: // 微软 Hypervisor 接口定义的常量。
+267: // SimpleSVM 专用常量。
+273: @brief      在存在内核调试器时触发断点。
+275: @details    此宏发出软件断点，仅在
+298: @brief      向内核调试器发送消息。
+300: @param[in]  Format - 用于输出的格式字符串。
+326: @brief      分配按页对齐且清零的物理内存。
+328: @details    This function allocates page aligned nonpaged pool. The
+333: @param[in]  NumberOfBytes - A size of memory to allocate in byte. This must
+336: @result     A pointer to the allocated memory filled with zero; or NULL when
+354: // 该结构大小必须不小于 PAGE_SIZE，才能分配
+369: @brief      释放 SvAllocatePageAlingedPhysicalMemory 分配的内存。
+371: @param[in]  BaseAddress - The address returned by
+386: @brief      分配按页对齐且清零的连续物理内存。
+388: @details    This function allocates page aligned nonpaged pool where backed
+393: @param[in]  NumberOfBytes - A size of memory to allocate in byte.
+395: @result     A pointer to the allocated memory filled with zero; or NULL when
+429: @brief      释放 SvAllocateContiguousMemory 分配的内存。
+431: @param[in]  BaseAddress - The address returned by SvAllocateContiguousMemory.
+445: @brief          注入错误码为零的 #GP。
+447: @param[in,out]  VpData - Per processor data.
+460: // 错误码固定为零。 See "#GP-General-Protection Exception
+461: // (Vector 13)" for details about the error code.
+472: @brief          处理执行 CPUID 指令导致的 #VMEXIT。
+474: @details        此函数返回未修改的 CPUID 结果。
+484: @param[in,out]  VpData - Per processor data.
+485: @param[in,out]  GuestContext - Guest's GPRs.
+500: // 按照来宾请求执行 CPUID。
+510: // 通过设置用于表示来宾状态的位来标记 Hypervisor 存在。
+511: // 该位由 Hypervisor 保留，用于表示来宾状态。 See "CPUID
+512: // Fn0000_0001_ECX Feature Identifiers".
+518: // 返回支持的最大 Hypervisor CPUID 叶范围和厂商
+528: // 返回非 Hv#1 值。 This indicate that the SimpleSvm does NOT
+529: // conform to the Microsoft hypervisor interface.
+561: // 宿主上下文调用 API 不安全，应完全避免；, unless the API is
+562: // documented to be accessible on IRQL IPI_LEVEL+. This is because
+563: // 宿主代码运行时中断已禁用, and IPI is not going
+564: // to be delivered when it is issued.
+566: // This code is not exception and violating this rule. The reasons for this
+567: // code are to demonstrate a bad example, and simply show that the SimpleSvm
+588: @brief          处理执行 WRMSR 和 RDMSR 指令导致的 #VMEXIT。
+591: @details        此逻辑防止来宾清除 EFER.SVME，
+595: @param[in,out]  VpData - Per processor data.
+596: @param[in,out]  GuestContext - Guest's GPRs.
+614: // 写入 IA32_MSR_EFER 时，必须保护 EFER_SVME 位
+620: // 访问 IA32_MSR_EFER 时，#VMEXIT 只应由写操作触发。
+629: // 如果来宾尝试清除 SVME 位，则注入 #GP。 Protection of
+630: // this bit is required because clearing the bit while guest is running
+631: // leads to undefined behavior.
+638: // 否则，按照来宾请求更新 MSR。 Important to note that the value
+639: // should be checked not to allow any illegal values, and inject #GP as
+640: // needed. Otherwise, the hypervisor attempts to resume the guest with an
+641: // illegal EFER and immediately receives #VMEXIT due to VMEXIT_INVALID,
+642: // which in our case, results in a bug check. See "Extended Feature Enable
+643: // Register (EFER)" for what values are allowed.
+652: // 如果访问的 MSR 不是 IA32_MSR_EFER, assert that #VMEXIT
+653: // can only occur on access to MSR outside the ranges controlled with
+654: // the MSR permissions map. This is true because the map is configured
+655: // not to intercept any MSR access but IA32_MSR_EFER. See
+656: // "MSRPM 覆盖的 MSR 范围" in "MSR 拦截" for the MSR ranges
+657: // controlled by the map.
+659: // 注意，VMware Workstation 存在一个问题 that access to unimplemented
+660: // MSRs unconditionally causes #VMEXIT ignoring bits in the MSR
+661: // permissions map. This can be tested by reading MSR zero, for example.
+668: // 代表来宾执行 WRMSR 或 RDMSR。 Important that this
+669: // can cause bug check when the guest tries to access unimplemented MSR
+670: // *even within the SEH block* because the below WRMSR or RDMSR raises
+671: // #GP and are not protected by the SEH block (or cannot be protected
+672: // either as this code run outside the thread stack region Windows
+673: // requires to proceed SEH). Hypervisors typically handle this by noop-ing
+674: // WRMSR and returning zero for RDMSR with non-architecturally defined
+675: // MSRs. Alternatively, one can probe which MSRs should cause #GP prior
+676: // to installation of a hypervisor and the hypervisor can emulate the
+677: // results.
+700: @brief          Handles #VMEXIT due to execution of the VMRUN instruction.
+702: @details        This function always injects #GP to the guest.
+704: @param[in,out]  VpData - Per processor data.
+705: @param[in,out]  GuestContext - Guest's GPRs.
+721: @brief          C-level entry point of the host code called from SvLaunchVm.
+723: @details        This function loads save host state first, and then, handles
+735: @param[in,out]  VpData - Per processor data.
+736: @param[in,out]  GuestRegisters - Guest's GPRs.
+738: @result         TRUE when virtualization is terminated; otherwise FALSE.
+756: // 加载 #VMEXIT 时不会自动加载的部分宿主状态。
+763: // 将 IRQL 提升到 DISPATCH_LEVEL。 由于
+764: // #VMEXIT 时中断已被禁用，这本身没有实际效果； 但当 of
+765: // 在此上下文中调用不允许使用的内核 API 时，可借助 Driver
+766: // Verifier. This protects developers from accidentally writing such #VMEXIT
+767: // handling code. This should actually raise IRQL to HIGH_LEVEL to represent
+768: // this running context better, but our Logger code is not designed to run at
+769: // that level unfortunately. Finally, note that this API is a thin wrapper
+770: // of mov-to-CR8 on x64 and safe to call on this context.
+779: // Guest's RAX is overwritten by the host's value on #VMEXIT and saved in
+780: // the VMCB instead. Reflect the guest RAX to the context.
+785: // Update the _KTRAP_FRAME structure values in hypervisor stack, so that
+786: // Windbg can reconstruct call stack of the guest during debug session.
+787: // This is optional but very useful thing to do for debugging.
+793: // Handle #VMEXIT according with its reason.
+813: // Again, no effect to change IRQL but restoring it here since a #VMEXIT
+814: // handler where the developers most likely call the kernel API inadvertently
+815: // is already executed.
+823: // Terminate the SimpleSvm hypervisor if requested.
+830: // Set return values of CPUID instruction as follows:
+831: //  RBX     = An address to return
+832: //  RCX     = A stack pointer to restore
+833: //  EDX:EAX = An address of per processor data to be freed by the caller
+841: // Load guest state (currently host state is loaded).
+846: // Set the global interrupt flag (GIF) but still disable interrupts by
+847: // clearing IF. GIF must be set to return to the normal execution, but
+848: // interruptions are not desirable until SVM is disabled as it would
+849: // execute random kernel-code in the host context.
+855: // Disable SVM, and restore the guest RFLAGS. This may enable interrupts.
+856: // Some of arithmetic flags are destroyed by the subsequent code.
+864: // Reflect potentially updated guest's RAX to VMCB. Again, unlike other GPRs,
+865: // RAX is loaded from VMCB on VMRUN.
+875: @brief      Returns attributes of a segment specified by the segment selector.
+877: @details    This function locates a segment descriptor from the segment
+890: @param[in]  SegmentSelector - A segment selector to get attributes of a
+892: @param[in]  GdtBase - A base address of GDT.
+894: @result     Attributes of the segment.
+909: // Get a segment descriptor corresponds to the specified segment selector.
+915: // Extract all attribute fields in the segment descriptor to a structure
+916: // that describes only attributes (as opposed to the segment descriptor
+917: // consists of multiple other fields).
+933: @brief      Tests whether the SimpleSvm hypervisor is installed.
+935: @details    This function checks a result of CPUID leaf 40000000h, which
+944: @result     TRUE when the SimpleSvm is installed; otherwise, FALSE.
+960: // When the SimpleSvm hypervisor is installed, CPUID leaf 40000000h will
+961: // return "SimpleSvm   " as the vendor name.
+973: @brief      虚拟化当前处理器。
+975: @details    This function enables SVM, initialize VMCB with the current
+979: @param[in,out]  VpData - The address of per processor data.
+980: @param[in]      SharedVpData - The address of share data.
+981: @param[in]      ContextRecord - The address of CONETEXT to use as an initial
+999: // Capture the current GDTR and IDTR to use as initial values of the guest
+1000: // mode.
+1012: // Configure to trigger #VMEXIT with CPUID and VMRUN instructions. CPUID is
+1013: // intercepted to present existence of the SimpleSvm hypervisor and provide
+1014: // an interface to ask it to unload itself.
+1016: // VMRUN is intercepted because it is required by the processor to enter the
+1017: // guest mode; otherwise, #VMEXIT occurs due to VMEXIT_INVALID when a
+1018: // processor attempts to enter the guest mode. See "Canonicalization and
+1019: // Consistency Checks" on "VMRUN Instruction".
+1025: // Also, configure to trigger #VMEXIT on MSR access as configured by the
+1026: // MSRPM. In our case, write to IA32_MSR_EFER is intercepted.
+1032: // Specify guest's address space ID (ASID). TLB is maintained by the ID for
+1033: // guests. Use the same value for all processors since all of them run a
+1034: // single guest in our case. Use 1 as the most likely supported ASID by the
+1035: // processor. The actual the supported number of ASID can be obtained with
+1036: // CPUID. See "CPUID Fn8000_000A_EBX SVM Revision and Feature
+1037: // Identification". Zero of ASID is reserved and illegal.
+1042: // Enable Nested Page Tables. By enabling this, the processor performs the
+1043: // nested page walk, that involves with an additional page walk to translate
+1044: // a guest physical address to a system physical address. An address of
+1045: // nested page tables is specified by the NCr3 field of VMCB.
+1047: // We have already build the nested page tables with SvBuildNestedPageTables.
+1049: // Note that our hypervisor does not trigger any additional #VMEXIT due to
+1050: // the use of Nested Page Tables since all physical addresses from 0-512 GB
+1051: // are configured to be accessible from the guest.
+1057: // Set up the initial guest state based on the current system state. Those
+1058: // values are loaded into the processor as guest state when the VMRUN
+1059: // instruction is executed.
+1090: // Save some of the current state on VMCB. Some of those states are:
+1091: // - FS, GS, TR, LDTR (including all hidden state)
+1092: // - KernelGsBase
+1093: // - STAR, LSTAR, CSTAR, SFMASK
+1094: // - SYSENTER_CS, SYSENTER_ESP, SYSENTER_EIP
+1095: // See "VMSAVE and VMLOAD Instructions" for mode details.
+1097: // Those are restored to the processor right before #VMEXIT with the VMLOAD
+1098: // instruction so that the guest can start its execution with saved state,
+1099: // and also, re-saved to the VMCS with right after #VMEXIT with the VMSAVE
+1100: // instruction so that the host (hypervisor) do not destroy guest's state.
+1105: // Store data to stack so that the host (hypervisor) can use those values.
+1114: // Set an address of the host state area to VM_HSAVE_PA MSR. The processor
+1115: // saves some of the current state on VMRUN and loads them on #VMEXIT. See
+1116: // "VM_HSAVE_PA MSR (C001_0117h)".
+1121: // Also, save some of the current state to VMCB for the host. This is loaded
+1122: // after #VMEXIT to reproduce the current state for the host (hypervisor).
+1128: @brief      虚拟化当前处理器。
+1130: @details    This function enables SVM, initialize VMCB with the current
+1134: @param[in]  Context - A pointer of share data.
+1136: @result     STATUS_SUCCESS on success; otherwise, an appropriate error code.
+1172: // Allocate per processor data.
+1185: // Capture the current RIP, RSP, RFLAGS, and segment selectors. This
+1186: // captured state is used as an initial state of the guest mode; therefore
+1187: // when virtualization starts by the later call of SvLaunchVm, a processor
+1188: // resume its execution at this location and state.
+1193: // First time of this execution, the SimpleSvm hypervisor is not installed
+1194: // yet. Therefore, the branch is taken, and virtualization is attempted.
+1196: // At the second execution of here, after SvLaunchVm virtualized the
+1197: // processor, SvIsSimpleSvmHypervisorInstalled returns TRUE, and this
+1198: // function exits with STATUS_SUCCESS.
+1206: // Enable SVM by setting EFER.SVME. It has already been verified that this
+1207: // bit was writable with SvIsSvmSupported.
+1212: // Set up VMCB, the structure describes the guest state and what events
+1213: // within the guest should be intercepted, ie, triggers #VMEXIT.
+1218: // Switch to the host RSP to run as the host (hypervisor), and then
+1219: // enters loop that executes code as a guest until #VMEXIT happens and
+1220: // handles #VMEXIT as the host.
+1222: // This function should never return to here.
+1241: // Frees per processor data if allocated and this function is
+1242: // unsuccessful.
+1250: @brief      Execute a callback on all processors one-by-one.
+1252: @details    This function execute Callback with Context as a parameter for
+1261: @param[in]  Callback - A function to execute on all processors.
+1262: @param[in]  Context - A parameter to pass to the callback.
+1263: @param[out] NumOfProcessorCompleted - A pointer to receive a number of
+1266: @result     STATUS_SUCCESS when Callback executed and returned STATUS_SUCCESS
+1289: // Get a number of processors on this system.
+1296: // Convert from an index to a processor number.
+1305: // Switch execution of this code to a processor #i.
+1313: // Execute the callback.
+1318: // Revert the previously executed processor.
+1323: // Exit if the callback returned error.
+1333: // i must be the same as the number of processors on the system when this
+1334: // function returns STATUS_SUCCESS;
+1339: // Set a number of processors that successfully executed callback if the
+1340: // out parameter is present.
+1344: *NumOfProcessorCompleted = i;
+1350: @brief      De-virtualize the current processor if virtualized.
+1352: @details    This function asks SimpleSVM hypervisor to deactivate itself
+1357: @param[in]  Context - An out pointer to receive an address of shared data.
+1359: @result     Always STATUS_SUCCESS.
+1382: // Ask SimpleSVM hypervisor to deactivate itself. If the hypervisor is
+1383: // installed, this ECX is set to 'SSVM', and EDX:EAX indicates an address
+1384: // of per processor data to be freed.
+1395: // Get an address of per processor data indicated by EDX:EAX.
+1403: // Save an address of shared data, then free per processor data.
+1406: *sharedVpDataPtr = vpData->HostStackLayout.SharedVpData;
+1414: @brief      De-virtualize all virtualized processors.
+1416: @details    This function execute a callback to de-virtualize a processor on
+1434: // De-virtualize all processors and free shared data when returned.
+1447: @brief          Build the MSR permissions map (MSRPM).
+1449: @details        This function sets up MSRPM to intercept to IA32_MSR_EFER,
+1466: @param[in,out]  MsrPermissionsMap - The MSRPM to set up.
+1482: // Setup and clear all bits, indicating no MSR access should be intercepted.
+1491: // Compute an offset from the second MSR permissions map offset (0x800) for
+1492: // IA32_MSR_EFER in bits. Then, add an offset until the second MSR
+1493: // permissions map.
+1499: // Set the MSB bit indicating write accesses to the MSR should be intercepted.
+1505: @brief      Build pass-through style page tables used in nested paging.
+1507: @details    This function build page tables used in Nested Page Tables. The
+1523: @param[out] SharedVpData - Out buffer to build nested page tables.
+1535: // Build only two PML4 entries. Those entries have subtables that control up to
+1536: // 1 TB physical memory. PFN points to a base physical address of the page
+1537: // directory pointer table.
+1544: // Set the US (User) bit of all nested page table entries to be translated
+1545: // without #VMEXIT, as all guest accesses are treated as user accesses at
+1546: // the nested level. Also, the RW (Write) bit of nested page table entries
+1547: // that corresponds to guest page tables must be 1 since all guest page
+1548: // table accesses are threated as write access. See "Nested versus Guest
+1549: // Page Faults, Fault Ordering" for more details.
+1551: // Those settings do not lower security since permission checks are done
+1552: // twice independently: based on guest page tables, and nested page tables.
+1553: // See "Nested versus Guest Page Faults, Fault Ordering" for more details.
+1562: // One PML4 entry controls 512 page directory pointer entires.
+1567: // PFN points to a base physical address of the page directory table.
+1576: // One page directory entry controls 512 page directory entries.
+1578: // We do not explicitly configure PAT in the NPT entry. The consequences
+1579: // of this are: 1) pages whose PAT (Page Attribute Table) type is the
+1580: // Write-Combining (WC) memory type could be treated as the
+1581: // Write-Combining Plus (WC+) while it should be WC when the MTRR type is
+1582: // either Write Protect (WP), Writethrough (WT) or Writeback (WB), and
+1583: // 2) pages whose PAT type is Uncacheable Minus (UC-) could be treated
+1584: // as Cache Disabled (CD) while it should be WC, when MTRR type is WC.
+1586: // While those are not desirable, this is acceptable given that 1) only
+1587: // introduces additional cache snooping and associated performance
+1588: // penalty, which would not be significant since WC+ still lets
+1589: // processors combine multiple writes into one and avoid large
+1590: // performance penalty due to frequent writes to memory without caching.
+1591: // 2) might be worse but I have not seen MTRR ranges configured as WC
+1592: // on testing, hence the unintentional UC- will just results in the same
+1593: // effective memory type as what would be with UC.
+1595: // See "Memory Types" (7.4), for details of memory types,
+1596: // "PAT-Register PA-Field Indexing", "Combining Guest and Host PAT Types",
+1597: // and "Combining PAT and MTRR Types" for how the effective memory type
+1598: // is determined based on Guest PAT type, Host PAT type, and the MTRR
+1599: // type.
+1601: // The correct approach may be to look up the guest PTE and copy the
+1602: // caching related bits (PAT, PCD, and PWT) when constructing NTP
+1603: // entries for non RAM regions, so the combined PAT will always be the
+1604: // same as the guest PAT type. This may be done when any issue manifests
+1605: // with the current implementation.
+1610: // PFN points to a base physical address of system physical address
+1611: // to be translated from a guest physical address. Set the PS
+1612: // (LargePage) bit to indicate that this is a large page and no
+1613: // subtable exists.
+1627: @brief      Test whether the current processor support the SVM feature.
+1629: @details    This function tests whether the current processor has enough
+1632: @result     TRUE if the processor supports the SVM feature; otherwise, FALSE.
+1649: // 检查当前处理器是否为 AMD。 An AMD processor should return
+1650: // "AuthenticAMD" from CPUID function 0. See "Function 0h-Maximum Standard
+1651: // Function Number and Vendor String".
+1663: // "Enabling SVM" and "CPUID Fn8000_0001_ECX Feature Identifiers".
+1673: // processor. See "Enabling Nested Paging" and "CPUID Fn8000_000A_EDX SVM
+1674: // Feature Identification".
+1683: // Test if the SVM feature can be enabled. When VM_CR.SVMDIS is set,
+1684: // EFER.SVME cannot be 1; therefore, SVM cannot be enabled. When
+1685: // VM_CR.SVMDIS is clear, EFER.SVME can be written normally and SVM can be
+1686: // enabled. See "Enabling SVM".
+1701: @brief      Virtualizes all processors on the system.
+1703: @details    This function attempts to virtualize all processors on the
+1709: @result     STATUS_SUCCESS on success; otherwise, an appropriate error code.
+1730: // not, exit as error.
+1740: // 分配所有处理器共享的数据结构。 This data is
+1741: // page tables used for Nested Page Tables.
+1754: // Allocate MSR permissions map (MSRPM) onto contiguous physical memory.
+1766: // Build nested page table and MSRPM.
+1772: // 逐个处理器执行 SvVirtualizeProcessor，建立虚拟化环境。
+1773: // How many processors were successfully virtualized is stored in the third
+1774: // parameter.
+1776: // 只有所有处理器都成功虚拟化时才返回 STATUS_SUCCESS。
+1777: // When any error occurs while virtualizing processors, this function does
+1778: // not attempt to virtualize the rest of processor. Therefore, only part of
+1779: // processors on the system may have been virtualized on error. In this case,
+1780: // it is a caller's responsibility to clean-up (de-virtualize) such
+1781: // processors.
+1791: // On failure, after successful allocation of shared data.
+1805: // If none of processors has not been virtualized, simply free
+1806: // shared data.
+1822: @brief      An entry point of this driver.
+1824: @param[in]  DriverObject - A driver object.
+1825: @param[in]  RegistryPath - Unused.
+1827: @result     STATUS_SUCCESS on success; otherwise, an appropriate error code.
+1851: // Opts-in no-execute (NX) nonpaged pool when available for security. By
+1852: // defining POOL_NX_OPTIN as 1 and calling this function, nonpaged pool
+1853: // allocation by the ExAllocatePool family with the NonPagedPool flag
+1854: // automatically allocates NX nonpaged pool on Windows 8 and later versions
+1855: // of Windows, while on Windows 7 where NX nonpaged pool is unsupported,
+1856: // executable nonpaged pool is returned as usual.
+1861: // Registers a power state callback (SvPowerCallbackRoutine) to handle
+1862: // system sleep and resume to manage virtualization state.
+1864: // First, opens the \Callback\PowerState callback object provides
+1865: // notification regarding power state changes. This is a system defined
+1866: // callback object that was already created by Windows. To open a system
+1867: // defined callback object, the Create parameter of ExCreateCallback must be
+1868: // FALSE (and AllowMultipleCallbacks is ignore when the Create parameter is
+1869: // FALSE).
+1882: // Then, registers our callback. The open callback object must be
+1883: // dereferenced.
+1897: // Virtualize all processors on the system.
+1905: // On success, save the registration handle for un-registration.
+1913: // On any failure, clean up stuff as needed.
+1924: @brief      Driver unload callback.
+1926: @details    This function de-virtualize all processors on the system.
+1928: @param[in]  DriverObject - Unused.
+1942: // Unregister the power state callback.
+1948: // De-virtualize all processors on the system.
+1954: @brief      PowerState callback routine.
+1956: @details    This function de-virtualize all processors when the system is
+1966: @param[in]  CallbackContext - Unused.
+1967: @param[in]  Argument1 - A PO_CB_XXX constant value.
+1968: @param[in]  Argument2 - A value of TRUE or FALSE.
+1982: // PO_CB_SYSTEM_STATE_LOCK of Argument1 indicates that a system power state
+1983: // change is imminent.
+1993: // The system has just reentered S0. Re-virtualize all processors.
+2000: // The system is about to exit system power state S0. De-virtualize all
+2001: // processors.
+### svm_core.hpp
+2: @file       SimpleSvm.hpp
+4: @brief      SVM 相关定义。
+6: @author     Satoshi Tanda
+8: @copyright  Copyright (c) 2017-2019, Satoshi Tanda. All rights reserved.
+15: // A size of two the MSR permissions map.
+20: // See "SVM Related MSRs"
+28: // See "VMCB Layout, Control Area"
+80: // See "VMCB Layout, State Save Area"
+161: // An entire VMCB (Virtual machine control block) layout.
+173: // See "Event Injection"
+195: // See "SVM Intercept Codes"
+### svm_entry.asm
+2: ; @file       x64.asm
+4: ; @brief      SVM 汇编入口代码。
+6: ; @author     Satoshi Tanda
+8: ; @copyright  Copyright (c) 2017-2019, Satoshi Tanda. All rights reserved.
+20: ;   @brief      将所有通用寄存器保存到栈上。
+22: ;   @details    此宏不会修改标志寄存器。
+44: ;   @brief      从栈中恢复所有通用寄存器。
+46: ;   @details    此宏不会修改标志寄存器。
+68: ;   @brief      Enters the loop that executes the guest and handles #VMEXIT.
+70: ;   @details    This function switches to the host stack pointer, runs the guest
+71: ;               and handles #VMEXIT until SvHandleVmExit returns non-zero value.
+72: ;               When SvHandleVmExit returned non-zero value, this function
+73: ;               returns execution flow to the next instruction of the
+74: ;               instruction triggered #VMEXIT after terminating virtualization.
+76: ;   @param[in]  HostRsp - Hypervisor 使用的栈指针。
+80: ; Update the current stack pointer with the host RSP. This protects
+81: ; values stored on stack for the hypervisor from being overwritten by
+82: ; the guest due to a use of the same stack memory.
+87: ; Run the loop to executed the guest and handle #VMEXIT. Below is the
+88: ; current stack leyout.
+90: ; Rsp          => 0x...fd0 GuestVmcbPa       ; HostStackLayout
+91: ;                 0x...fd8 HostVmcbPa        ;
+92: ;                 0x...fe0 Self              ;
+93: ;                 0x...fe8 SharedVpData      ;
+94: ;                 0x...ff0 Padding1          ;
+95: ;                 0x...ff8 Reserved1         ;
+102: ; 启动来宾。 VMRUN 指令恢复来宾执行
+103: ; 使用 VMCB 中描述的状态 (specified by RAX by its physical address)
+104: ; 直到触发 #VMEXIT。 On #VMEXIT, the VMRUN instruction completes
+105: ; and resumes the next instruction (ie, vmsave in our case).
+107: ; VMRUN 指令按以下顺序执行：
+109: ;   区域，该区域由 IA32_MSR_VM_HSAVE_PA 指定；
+110: ; - 从 VMCB 状态保存区加载来宾状态；
+112: ; - 恢复来宾执行，直到发生 #VMEXIT；
+115: ; #VMEXIT 发生后：
+117: ; - 保存当前来宾状态并更新 VMCB，以提供
+118: ;   处理 #VMEXIT 所需的信息
+119: ; - 加载 VMRUN 指令之前保存的宿主状态
+120: ; See "#VMEXIT" in the volume 2 and "VMRUN" in the volume 3 for more
+121: ; details.
+126: ; #VMEXIT occurred. Now, some of guest state has been saved to VMCB, but
+127: ; 并非全部状态都已保存。 使用 VMSAVE 指令保存尚未保存的部分状态。
+135: ; 可选地分配陷阱帧 以便 WinDbg 可以显示来宾的栈
+136: ; 跟踪，SvHandleVmExit 执行期间所需的陷阱帧字段会在该函数中初始化。 The trap
+137: ; frame fields necessary for this are initialized in SvHandleVmExit.
+150: ; 设置 SvHandleVmExit 的参数。 Below is the current stack layout.
+152: ; Rsp                             => 0x...dc0 R15               ; GUEST_REGISTERS
+156: ; Rsp + 8 * 16                    => 0x...e40 TrapFrame         ; HostStackLayout
+158: ; Rsp + 8 * 16 + KTRAP_FRAME_SIZE => 0x...fd0 GuestVmcbPa       ;
+159: ;                                    0x...fd8 HostVmcbPa        ;
+160: ; Rsp + 8 * 18 + KTRAP_FRAME_SIZE => 0x...fe0 Self              ;
+161: ;                                    0x...fe8 SharedVpData      ;
+162: ;                                    0x...ff0 Padding1          ;
+163: ;                                    0x...ff8 Reserved1         ;
+170: ; Allocate stack for homing space (0x20) and volatile XMM registers
+172: ; any of those registers. 不保存 XMM6-XMM15，因为它们应当
+173: ; 保持不变（它们是非易失寄存器）。 Finally, indicates the
+174: ; end of the function prolog as stack pointer changes are all done. This
+175: ; is for Windbg to reconstruct stack trace.
+187: ; 处理 #VMEXIT。
+203: ; 检查 SvHandleVmExit 的返回值（RAX），然后执行 POPAQ 恢复
+210: ; 如果 SvHandleVmExit 返回非零值，则退出
+220: ; next instruction of CPUID triggered this #VMEXIT.
+223: ;   RBX     = An address to return
+224: ;   RCX     = An original stack pointer to restore
+225: ;   EDX:EAX = An address of per processor data for this processor
+230: ; 将 RCX 更新为表示 LMvtdriver
+231: ; Hypervisor 已卸载的魔数。
+236: ; 返回到触发该 #VMEXIT 的 CPUID 下一条指令。 The
+237: ; registry values to be returned are:
+239: ;   ECX     = 'SSVM'
+240: ;   EDX:EAX = An address of per processor data for this processor
