@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ntifs.h>
+#include "lmv_control_shared.h"
 
 //
 // x86-64 defined structures.
@@ -97,12 +98,60 @@ typedef struct _NPT_TEST_REGION
     DECLSPEC_ALIGN(PAGE_SIZE) UINT64 Ptes[512];
 } NPT_TEST_REGION, *PNPT_TEST_REGION;
 
+
+typedef struct _NPT_DEBUG_REGION
+{
+    UINT64 Base;
+    UINT64 OriginalPde;
+    UINT64 PtesPhysicalAddress;
+    volatile LONG State;
+    DECLSPEC_ALIGN(PAGE_SIZE) UINT64 Ptes[512];
+} NPT_DEBUG_REGION, *PNPT_DEBUG_REGION;
+typedef struct _NPT_DEBUG_HOOK
+{
+    volatile LONG State;
+    ULONG ProcessId;
+    ULONG PatchOffset;
+    ULONG PatchLength;
+    UINT64 GuestPhysicalAddress;
+    UINT64 OriginalHostPhysicalAddress;
+    UINT64 ShadowHostPhysicalAddress;
+    UINT64 EntryAddress;
+    UINT64 MirrorAddress;
+    UINT64 RedirectAddress;
+    volatile LONG ExecuteProbe;
+    DECLSPEC_ALIGN(PAGE_SIZE) UINT8 ShadowPage[PAGE_SIZE];
+} NPT_DEBUG_HOOK, *PNPT_DEBUG_HOOK;
 typedef struct _SHARED_VIRTUAL_PROCESSOR_DATA
 {
     PVOID MsrPermissionsMap;
+    DECLSPEC_ALIGN(PAGE_SIZE) LMV_SHARED_PAGE SharedPage;
     volatile LONG NptTestControlLock;
+    volatile LONG64 VmExitTotal;
+    volatile LONG64 NpfTotal;
+    ULONG ProcessorCount;
+    volatile LONG DebugAttached;
+    volatile ULONG DebugProcessId;
+    volatile LONG KiSessionEnabled;
+    volatile LONG KiGuestRegistered;
+    volatile LONG KiGuestRetired;
+    volatile LONG KiGuestReleased;
+    volatile LONG KiArmedProcessors;
+    volatile LONG64 KiInFlight;
+    UINT64 KiGuestBase;
+    UINT64 KiGuestEnd;
+    UINT64 KiCaptureExit;
+    UINT64 KiCommitExit;
+    UINT64 KiPassExit;
+    UINT64 KiSessionCr3Mask;
+    UINT64 KiSessionCr3;
+    UINT64 KiSessionEntry;
+    UINT64 KiSessionEventStub;
+    UINT64 KiSessionPassStub;
     NPT_TEST_REGION NptTestRegions[4];
     NPT_TEST_PAGE NptTestPages[4];
+    NPT_DEBUG_REGION DebugRegion;
+    NPT_DEBUG_HOOK DebugHook;
     DECLSPEC_ALIGN(PAGE_SIZE) PML4_ENTRY_2MB Pml4Entries[512];
     DECLSPEC_ALIGN(PAGE_SIZE) PML4E_TREE Pml4eTrees[2];    // For 1TB
 } SHARED_VIRTUAL_PROCESSOR_DATA, *PSHARED_VIRTUAL_PROCESSOR_DATA;
@@ -128,3 +177,10 @@ BOOLEAN SvReleaseNptTestRegion(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData, UINT
 volatile LONG64* SvGetNptTestPte(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData, UINT64 GuestPhysicalAddress);
 BOOLEAN SvArmNptTestWriteWatch(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData, UINT64 GuestPhysicalAddress);
 BOOLEAN SvDisarmNptTestWriteWatch(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData, UINT64 GuestPhysicalAddress);
+
+BOOLEAN SvInstallNptDebugHook(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData, ULONG ProcessId, UINT64 GuestPhysicalAddress, ULONG PatchOffset, const UCHAR* PatchBytes, ULONG PatchLength, PVOID Info);
+BOOLEAN SvRemoveNptDebugHook(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData, PVOID Info);
+BOOLEAN SvInstallNptExecProbe(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData, ULONG ProcessId, UINT64 GuestPhysicalAddress, UINT64 EntryAddress, UINT64 MirrorAddress, UINT64 RedirectAddress);
+BOOLEAN SvHandleNptExecProbe(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData, UINT64 GuestPhysicalAddress, UINT64 ExitInfo1, PUINT64 GuestRip);
+
+BOOLEAN SvReleaseNptDebugHookRegion(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData);

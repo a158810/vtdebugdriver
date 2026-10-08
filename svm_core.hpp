@@ -30,6 +30,7 @@
 #define SVM_INTERCEPT_MISC1_CPUID       (1UL << 18)
 #define SVM_INTERCEPT_MISC1_MSR_PROT    (1UL << 28)
 #define SVM_INTERCEPT_MISC2_VMRUN       (1UL << 0)
+#define SVM_INTERCEPT_MISC2_VMMCALL     (1UL << 1)
 #define SVM_NP_ENABLE_NP_ENABLE         (1UL << 0)
 
 typedef struct _VMCB_CONTROL_AREA

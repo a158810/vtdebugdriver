@@ -64,6 +64,22 @@ SvTranslateNpt2Mb (
     }
     if (region == nullptr)
     {
+        PNPT_DEBUG_REGION debugRegion = &SharedVpData->DebugRegion;
+        if (debugRegion->State == NPT_TEST_REGION_ACTIVE &&
+            debugRegion->Base == (GuestPhysicalAddress & ~((1ull << 21) - 1)) &&
+            debugRegion->PtesPhysicalAddress ==
+                (pdEntryValue & 0x000ffffffffff000ull))
+        {
+            pteValue = debugRegion->Ptes[(GuestPhysicalAddress >> PAGE_SHIFT) & 0x1ff];
+            if ((pteValue & 1) == 0)
+                return FALSE;
+            *HostPhysicalAddress = (pteValue & 0x000ffffffffff000ull) |
+                                   (GuestPhysicalAddress & (PAGE_SIZE - 1));
+            return TRUE;
+        }
+    }
+    if (region == nullptr)
+    {
         return FALSE;
     }
 
@@ -163,6 +179,13 @@ SvRegisterNptTestPage (
         return FALSE;
     }
 
+    if (SharedVpData->DebugRegion.State != NPT_TEST_REGION_FREE &&
+        SharedVpData->DebugRegion.Base ==
+            (GuestPhysicalAddress & ~((1ull << 21) - 1)))
+    {
+        InterlockedExchange(&SharedVpData->NptTestControlLock, 0);
+        return FALSE;
+    }
     PNPT_TEST_REGION region = SvFindNptTestRegion(SharedVpData, GuestPhysicalAddress);
     PNPT_TEST_PAGE freePage = nullptr;
     BOOLEAN hasFreeRegion = FALSE;
@@ -523,3 +546,247 @@ SvDisarmNptTestWriteWatch (
     return TRUE;
 }
 
+
+BOOLEAN
+SvInstallNptDebugHook(
+    _Inout_ PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData,
+    _In_ ULONG ProcessId,
+    _In_ UINT64 GuestPhysicalAddress,
+    _In_ ULONG PatchOffset,
+    _In_reads_bytes_(PatchLength) const UCHAR* PatchBytes,
+    _In_ ULONG PatchLength,
+    _Out_opt_ PVOID Info
+    )
+{
+    UNREFERENCED_PARAMETER(Info);
+    if (SharedVpData == nullptr || PatchBytes == nullptr ||
+        (GuestPhysicalAddress & (PAGE_SIZE - 1)) != 0 ||
+        PatchLength == 0 || PatchLength > 16 ||
+        PatchOffset >= PAGE_SIZE || PatchLength > PAGE_SIZE - PatchOffset ||
+        ProcessId == 0 ||
+        InterlockedCompareExchange(&SharedVpData->DebugHook.State, 2, 0) != 0)
+        return FALSE;
+
+    PNPT_DEBUG_REGION region = &SharedVpData->DebugRegion;
+    PNPT_DEBUG_HOOK hook = &SharedVpData->DebugHook;
+    UINT64 originalHostPhysicalAddress = 0;
+    BOOLEAN success = FALSE;
+    if (region->State != NPT_TEST_REGION_FREE ||
+        region->PtesPhysicalAddress == 0 || hook->ShadowHostPhysicalAddress == 0 ||
+        !SvTranslateNpt2Mb(SharedVpData, GuestPhysicalAddress,
+                            &originalHostPhysicalAddress) ||
+        originalHostPhysicalAddress != GuestPhysicalAddress)
+        goto Exit;
+
+    {
+        PHYSICAL_ADDRESS originalPa = {};
+        originalPa.QuadPart = originalHostPhysicalAddress;
+        PVOID originalPage = MmMapIoSpace(originalPa, PAGE_SIZE, MmCached);
+        if (originalPage == nullptr)
+            goto Exit;
+        RtlCopyMemory(hook->ShadowPage, originalPage, PAGE_SIZE);
+        MmUnmapIoSpace(originalPage, PAGE_SIZE);
+    }
+    RtlCopyMemory(hook->ShadowPage + PatchOffset, PatchBytes, PatchLength);
+
+    if (InterlockedCompareExchange(&SharedVpData->NptTestControlLock, 1, 0) != 0)
+        goto Exit;
+    PD_ENTRY_2MB* pde = SvGetNptPde(SharedVpData, GuestPhysicalAddress);
+    if (region->State == NPT_TEST_REGION_FREE && pde != nullptr &&
+        pde->Fields.Valid != 0 && pde->Fields.LargePage != 0 &&
+        (pde->Fields.PageFrameNumber << 21) ==
+            (GuestPhysicalAddress & ~((1ull << 21) - 1)))
+    {
+        UINT64 originalPde = pde->AsUInt64;
+        UINT64 hostRegionBase = pde->Fields.PageFrameNumber << 21;
+        UINT64 flags = originalPde & (0x7full | (1ull << 8) | (1ull << 63));
+        if ((originalPde & (1ull << 12)) != 0)
+            flags |= (1ull << 7);
+        for (ULONG index = 0; index < 512; ++index)
+        {
+            UINT64 hostPage = hostRegionBase +
+                (static_cast<UINT64>(index) << PAGE_SHIFT);
+            region->Ptes[index] =
+                (hostPage & 0x000ffffffffff000ull) | flags;
+        }
+        region->Ptes[(GuestPhysicalAddress >> PAGE_SHIFT) & 0x1ff] =
+            (hook->ShadowHostPhysicalAddress & 0x000ffffffffff000ull) | flags;
+        region->Base = GuestPhysicalAddress & ~((1ull << 21) - 1);
+        region->OriginalPde = originalPde;
+        region->State = NPT_TEST_REGION_ACTIVE;
+        hook->ProcessId = ProcessId;
+        hook->PatchOffset = PatchOffset;
+        hook->PatchLength = PatchLength;
+        hook->GuestPhysicalAddress = GuestPhysicalAddress;
+        hook->OriginalHostPhysicalAddress = originalHostPhysicalAddress;
+        KeMemoryBarrier();
+        UINT64 pdeValue = (region->PtesPhysicalAddress & 0x000ffffffffff000ull) |
+                          (originalPde & (0x7full | (1ull << 8) | (1ull << 63)));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&pde->AsUInt64),
+                              static_cast<LONG64>(pdeValue));
+        KeMemoryBarrier();
+        success = TRUE;
+    }
+    InterlockedExchange(&SharedVpData->NptTestControlLock, 0);
+
+Exit:
+    InterlockedExchange(&hook->State, success ? 1 : 0);
+    return success;
+}
+
+BOOLEAN
+SvInstallNptExecProbe(
+    _Inout_ PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData,
+    _In_ ULONG ProcessId,
+    _In_ UINT64 GuestPhysicalAddress,
+    _In_ UINT64 EntryAddress,
+    _In_ UINT64 MirrorAddress,
+    _In_ UINT64 RedirectAddress
+    )
+{
+    if (SharedVpData == nullptr || ProcessId == 0 || GuestPhysicalAddress == 0 ||
+        (GuestPhysicalAddress & (PAGE_SIZE - 1)) != 0 ||
+        (EntryAddress & ~(static_cast<UINT64>(PAGE_SIZE) - 1)) != EntryAddress ||
+        (MirrorAddress & (PAGE_SIZE - 1)) != 0 ||
+        RedirectAddress == 0 ||
+        InterlockedCompareExchange(&SharedVpData->DebugHook.State, 2, 0) != 0)
+        return FALSE;
+
+    PNPT_DEBUG_REGION region = &SharedVpData->DebugRegion;
+    PNPT_DEBUG_HOOK hook = &SharedVpData->DebugHook;
+    UINT64 originalHpa = 0;
+    BOOLEAN success = FALSE;
+    if (region->State != NPT_TEST_REGION_FREE ||
+        region->PtesPhysicalAddress == 0 ||
+        !SvTranslateNpt2Mb(SharedVpData, GuestPhysicalAddress, &originalHpa) ||
+        originalHpa != GuestPhysicalAddress ||
+        InterlockedCompareExchange(&SharedVpData->NptTestControlLock, 1, 0) != 0)
+        goto Exit;
+
+    {
+        PD_ENTRY_2MB* pde = SvGetNptPde(SharedVpData, GuestPhysicalAddress);
+        if (pde != nullptr && pde->Fields.Valid != 0 && pde->Fields.LargePage != 0 &&
+            (pde->Fields.PageFrameNumber << 21) ==
+                (GuestPhysicalAddress & ~((1ull << 21) - 1)))
+        {
+            UINT64 originalPde = pde->AsUInt64;
+            UINT64 hostBase = pde->Fields.PageFrameNumber << 21;
+            UINT64 flags = originalPde & (0x7full | (1ull << 8) | (1ull << 63));
+            if ((originalPde & (1ull << 12)) != 0)
+                flags |= (1ull << 7);
+            for (ULONG index = 0; index < 512; ++index)
+                region->Ptes[index] =
+                    ((hostBase + (static_cast<UINT64>(index) << PAGE_SHIFT)) &
+                     0x000ffffffffff000ull) | flags;
+            region->Ptes[(GuestPhysicalAddress >> PAGE_SHIFT) & 0x1ff] |= 1ull << 63;
+            region->Base = GuestPhysicalAddress & ~((1ull << 21) - 1);
+            region->OriginalPde = originalPde;
+            region->State = NPT_TEST_REGION_ACTIVE;
+            hook->ProcessId = ProcessId;
+            hook->GuestPhysicalAddress = GuestPhysicalAddress;
+            hook->OriginalHostPhysicalAddress = originalHpa;
+            hook->EntryAddress = EntryAddress;
+            hook->MirrorAddress = MirrorAddress;
+            hook->RedirectAddress = RedirectAddress;
+            hook->ExecuteProbe = 1;
+            KeMemoryBarrier();
+            UINT64 pdeValue = (region->PtesPhysicalAddress & 0x000ffffffffff000ull) |
+                              (originalPde & (0x7full | (1ull << 8) | (1ull << 63)));
+            InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&pde->AsUInt64),
+                                  static_cast<LONG64>(pdeValue));
+            KeMemoryBarrier();
+            success = TRUE;
+        }
+    }
+    InterlockedExchange(&SharedVpData->NptTestControlLock, 0);
+Exit:
+    InterlockedExchange(&hook->State, success ? 1 : 0);
+    return success;
+}
+
+BOOLEAN
+SvHandleNptExecProbe(
+    _In_ PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData,
+    _In_ UINT64 GuestPhysicalAddress,
+    _In_ UINT64 ExitInfo1,
+    _Inout_ PUINT64 GuestRip
+    )
+{
+    PNPT_DEBUG_HOOK hook = &SharedVpData->DebugHook;
+    if (hook->ExecuteProbe != 1 ||
+        (GuestPhysicalAddress & ~(static_cast<UINT64>(PAGE_SIZE) - 1)) !=
+            hook->GuestPhysicalAddress ||
+        (ExitInfo1 & 0x11ull) != 0x11ull || (ExitInfo1 & 0x2ull) != 0)
+        return FALSE;
+    if (hook->State != 1)
+        return TRUE;
+    if ((*GuestRip & ~(static_cast<UINT64>(PAGE_SIZE) - 1)) != hook->EntryAddress)
+        return FALSE;
+    *GuestRip = *GuestRip == hook->EntryAddress ?
+        hook->RedirectAddress :
+        hook->MirrorAddress + (*GuestRip & (PAGE_SIZE - 1));
+    return TRUE;
+}
+
+BOOLEAN
+SvRemoveNptDebugHook(
+    _Inout_ PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData,
+    _Out_opt_ PVOID Info
+    )
+{
+    UNREFERENCED_PARAMETER(Info);
+    if (SharedVpData == nullptr ||
+        InterlockedCompareExchange(&SharedVpData->DebugHook.State, 2, 1) != 1)
+        return FALSE;
+
+    PNPT_DEBUG_REGION region = &SharedVpData->DebugRegion;
+    BOOLEAN success = FALSE;
+    if (InterlockedCompareExchange(&SharedVpData->NptTestControlLock, 1, 0) != 0)
+        goto Exit;
+    PD_ENTRY_2MB* pde = SvGetNptPde(
+        SharedVpData, SharedVpData->DebugHook.GuestPhysicalAddress);
+    if (region->State == NPT_TEST_REGION_ACTIVE && pde != nullptr &&
+        (pde->AsUInt64 & 0x000ffffffffff000ull) == region->PtesPhysicalAddress &&
+        (pde->AsUInt64 & (1ull << 7)) == 0)
+    {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&pde->AsUInt64),
+                              static_cast<LONG64>(region->OriginalPde));
+        KeMemoryBarrier();
+        region->State = NPT_TEST_REGION_RETIRED;
+        success = TRUE;
+    }
+    InterlockedExchange(&SharedVpData->NptTestControlLock, 0);
+
+Exit:
+    InterlockedExchange(&SharedVpData->DebugHook.State, success ? 0 : 1);
+    return success;
+}
+
+BOOLEAN
+SvReleaseNptDebugHookRegion(
+    _Inout_ PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData
+    )
+{
+    if (SharedVpData == nullptr ||
+        InterlockedCompareExchange(&SharedVpData->NptTestControlLock, 1, 0) != 0)
+        return FALSE;
+    PNPT_DEBUG_REGION region = &SharedVpData->DebugRegion;
+    PD_ENTRY_2MB* pde = SvGetNptPde(SharedVpData, region->Base);
+    BOOLEAN success = region->State == NPT_TEST_REGION_RETIRED &&
+        SharedVpData->DebugHook.State == 0 && pde != nullptr &&
+        ((pde->AsUInt64 ^ region->OriginalPde) & ~0x60ull) == 0;
+    if (success)
+    {
+        region->Base = 0;
+        region->OriginalPde = 0;
+        region->State = NPT_TEST_REGION_FREE;
+        SharedVpData->DebugHook.GuestPhysicalAddress = 0;
+        SharedVpData->DebugHook.OriginalHostPhysicalAddress = 0;
+        SharedVpData->DebugHook.ExecuteProbe = 0;
+        SharedVpData->DebugHook.EntryAddress = 0;
+        SharedVpData->DebugHook.MirrorAddress = 0;
+        SharedVpData->DebugHook.RedirectAddress = 0;
+    }
+    InterlockedExchange(&SharedVpData->NptTestControlLock, 0);
+    return success;
+}

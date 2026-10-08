@@ -12,6 +12,7 @@
 #include "lmv_npt_test_shared.h"
 #include "npt_manager.hpp"
 #include "lmv_control_shared.h"
+#include "ki_session_lifecycle.hpp"
 
 #include <intrin.h>
 #include <ntifs.h>
@@ -20,6 +21,9 @@
 EXTERN_C DRIVER_INITIALIZE DriverEntry;
 static DRIVER_UNLOAD SvDriverUnload;
 static CALLBACK_FUNCTION SvPowerCallbackRoutine;
+static volatile LONG g_DebugAttached;
+static volatile ULONG g_DebugProcessId;
+static PDRIVER_OBJECT g_HostDriverObject;
 
 EXTERN_C
 VOID
@@ -135,9 +139,39 @@ typedef struct _VIRTUAL_PROCESSOR_DATA
     UINT64 NptWatchRetryRip;
     UINT64 NptWatchRetryGpa;
     ULONG NptWatchRetryCount;
+    UINT64 PrivateDr3Target;
+    UINT64 OriginalHostDr3;
+    UINT64 OriginalHostDr7;
+    UINT64 GuestShadowDr3;
+    UINT64 GuestShadowDr7;
+    volatile LONG64 PrivateDr3Hits;
+    BOOLEAN PrivateDr3OneShot;
+    BOOLEAN PrivateDr3Persistent;
+    BOOLEAN KiExitPending;
+    UINT64 KiExitRax;
+    UINT64 KiExitRflags;
+    UINT64 KiExitRsp;
+    UINT64 PrivateDr3RedirectRip;
+    UINT64 PrivateDr3LastRip;
+    UINT64 PrivateDr3LastDr6;
+    UINT64 PrivateDr3LastCr3;
+    UINT64 PrivateDr3LastRcx;
+    UINT64 PrivateDr3LastRdx;
+    UINT64 PrivateDr3LastR8;
+    UINT64 PrivateDr3LastR9;
+    UINT64 PrivateDr3LastRsp;
+    UINT64 PrivateDr3LastRflags;
+    UINT64 PrivateDr3LastRax;
+    UINT64 PrivateDr3LastRbp;
     USHORT ProcessorGroup;
     USHORT ProcessorNumber;
 } VIRTUAL_PROCESSOR_DATA, *PVIRTUAL_PROCESSOR_DATA;
+static_assert(FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.Self) -
+              FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.GuestVmcbPa) == 0x10,
+              "Self offset mismatch");
+static_assert(FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.Reserved1) -
+              FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.GuestVmcbPa) == 0x28,
+              "Host stack layout mismatch");
 static_assert(sizeof(VIRTUAL_PROCESSOR_DATA) >=
               KERNEL_STACK_SIZE + PAGE_SIZE * 3 +
               sizeof(LONG64) * 2 + sizeof(USHORT) * 2,
@@ -185,6 +219,7 @@ typedef struct _GUEST_CONTEXT
 #define CPUID_FN8000_0001_ECX_SVM                   (1UL << 2)
 #define CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT    (1UL << 31)
 #define CPUID_FN8000_000A_EDX_NP                    (1UL << 0)
+#define CPUID_FN8000_000A_EDX_DECODE_ASSISTS        (1UL << 7)
 
 #define CPUID_MAX_STANDARD_FN_NUMBER_AND_VENDOR_STRING          0x00000000
 #define CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS       0x00000001
@@ -625,11 +660,13 @@ SvHandleCpuid (
         UINT32 sequence;
         UINT32 status;
         UINT32 flags;
+        BOOLEAN directResult;
 
         commandId = static_cast<UINT32>(GuestContext->VpRegs->R14);
         sequence = static_cast<UINT32>(GuestContext->VpRegs->R13);
         status = LMV_CPUID_RESULT_UNSUPPORTED;
         flags = 0;
+        directResult = FALSE;
 
         if (GuestContext->VpRegs->R15 != LMV_CPUID_CALL_MAGIC)
         {
@@ -652,9 +689,643 @@ SvHandleCpuid (
                     break;
 
                 case LmvCpuidCommandNotifySharedCommand:
-                    // 共享命令区尚未接入；当前命令仅验证门铃协议。
-                    status = LMV_CPUID_RESULT_UNSUPPORTED;
+                    if (VpData->HostStackLayout.SharedVpData->SharedPage.Magic != LMV_SHARED_PAGE_MAGIC ||
+                        VpData->HostStackLayout.SharedVpData->SharedPage.Version != LMV_CPUID_PROTOCOL_VERSION ||
+                        VpData->HostStackLayout.SharedVpData->SharedPage.Size != sizeof(LMV_SHARED_PAGE) ||
+                        InterlockedCompareExchange(
+                            reinterpret_cast<volatile LONG*>(&VpData->HostStackLayout.SharedVpData->SharedPage.State),
+                            LMV_SHARED_STATE_PROCESSING,
+                            LMV_SHARED_STATE_READY) != LMV_SHARED_STATE_READY)
+                    {
+                        status = LMV_CPUID_RESULT_INVALID_ARGUMENT;
+                    }
+                    else
+                    {
+                        PLMV_SHARED_PAGE page = &VpData->HostStackLayout.SharedVpData->SharedPage;
+                        RtlZeroMemory(&page->Result, sizeof(page->Result));
+                        page->Result.Version = LMV_CPUID_PROTOCOL_VERSION;
+                        page->Result.Size = sizeof(LMV_SHARED_RESULT);
+                        page->Result.Sequence = page->Command.Sequence;
+                        if (page->Command.Version != LMV_CPUID_PROTOCOL_VERSION ||
+                            page->Command.Size != sizeof(LMV_SHARED_COMMAND) ||
+                            page->Command.Sequence != sequence)
+                        {
+                            page->Result.Status = LMV_CPUID_RESULT_INVALID_ARGUMENT;
+                        }
+                        else if (VpData->HostStackLayout.SharedVpData->KiGuestRetired &&
+                            page->Command.CommandId != LmvDebugCommandQueryKiDrain &&
+                            page->Command.CommandId != LmvDebugCommandRetireKiGuest &&
+                            page->Command.CommandId != LmvCpuidCommandQueryStatus)
+                        {
+                            page->Result.Status = static_cast<ULONG>(STATUS_DELETE_PENDING);
+                        }
+                        else if (VpData->HostStackLayout.SharedVpData->KiGuestRegistered &&
+                            page->Command.CommandId != LmvDebugCommandStartKiSession &&
+                            page->Command.CommandId != LmvDebugCommandStopKiSession &&
+                            page->Command.CommandId != LmvDebugCommandQueryKiDrain &&
+                            page->Command.CommandId != LmvDebugCommandRetireKiGuest &&
+                            page->Command.CommandId != LmvDebugCommandTranslateNpt &&
+                            page->Command.CommandId != LmvCpuidCommandQueryStatus)
+                        {
+                            page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                        }
+                        else if (page->Command.CommandId == LmvCpuidCommandQueryStatus)
+                        {
+                            page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                            page->Result.Flags = LMV_STATUS_FLAG_SVM_RUNNING;
+                        }
+                         else if (page->Command.CommandId == LmvDebugCommandArmPrivateDr3)
+                         {
+                             UINT64 target = page->Command.Argument0;
+                             if (target == 0 || (target >> 48) != 0xffff ||
+                                 VpData->PrivateDr3Target != 0)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_INVALID_PARAMETER);
+                             else
+                             {
+                                 VpData->PrivateDr3OneShot = FALSE;
+                                 VpData->PrivateDr3RedirectRip = 0;
+                                 VpData->PrivateDr3Target = target;
+                                 VpData->GuestVmcb.StateSaveArea.Dr6 &= ~8ULL;
+                                 VpData->GuestVmcb.StateSaveArea.Dr7 =
+                                     (VpData->GuestShadowDr7 & ~0xF00000C0ULL) | 0x40;
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 page->Result.Value0 = static_cast<UINT64>(
+                                     InterlockedCompareExchange64(&VpData->PrivateDr3Hits, 0, 0));
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandDisarmPrivateDr3)
+                         {
+                             VpData->GuestVmcb.StateSaveArea.Dr7 =
+                                 VpData->GuestShadowDr7 & ~0xF00000C0ULL;
+                             VpData->PrivateDr3Target = 0;
+                             VpData->PrivateDr3OneShot = FALSE;
+                             VpData->PrivateDr3RedirectRip = 0;
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             page->Result.Value0 = static_cast<UINT64>(
+                                 InterlockedCompareExchange64(&VpData->PrivateDr3Hits, 0, 0));
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandQueryPrivateDr3)
+                         {
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             page->Result.Value0 = static_cast<UINT64>(
+                                 InterlockedCompareExchange64(&VpData->PrivateDr3Hits, 0, 0));
+                             page->Result.Value1 = VpData->PrivateDr3Target;
+                             page->Result.Value2 = VpData->GuestShadowDr3;
+                             page->Result.Value3 = VpData->GuestShadowDr7;
+                         }
+                          else if (page->Command.CommandId == LmvDebugCommandArmKiDr3Once ||
+                                   page->Command.CommandId == LmvDebugCommandArmKiDr3RedirectOnce)
+                          {
+                              UINT64 target = page->Command.Argument0;
+                              UINT64 redirect = page->Command.CommandId == LmvDebugCommandArmKiDr3RedirectOnce ?
+                                  page->Command.Argument1 : 0;
+                              if (target == 0 || (target >> 48) != 0xffff ||
+                                  (page->Command.CommandId == LmvDebugCommandArmKiDr3RedirectOnce &&
+                                   (redirect == 0 || (redirect >> 48) != 0xffff)) ||
+                                  VpData->PrivateDr3Target != 0)
+                                  page->Result.Status = static_cast<ULONG>(STATUS_INVALID_PARAMETER);
+                              else
+                              {
+                                  VpData->PrivateDr3LastRip = 0;
+                                  VpData->PrivateDr3LastDr6 = 0;
+                                  VpData->PrivateDr3LastCr3 = 0;
+                                  VpData->PrivateDr3LastRcx = 0;
+                                  VpData->PrivateDr3LastRdx = 0;
+                                  VpData->PrivateDr3LastR8 = 0;
+                                  VpData->PrivateDr3LastR9 = 0;
+                                  VpData->PrivateDr3LastRsp = 0;
+                                  VpData->PrivateDr3LastRflags = 0;
+                                  VpData->PrivateDr3LastRax = 0;
+                                  VpData->PrivateDr3LastRbp = 0;
+                                  VpData->GuestVmcb.StateSaveArea.Dr6 &= ~8ULL;
+                                  VpData->GuestVmcb.StateSaveArea.Dr7 =
+                                      (VpData->GuestShadowDr7 & ~0xF00000C0ULL) | 0x40;
+                                  VpData->PrivateDr3RedirectRip = redirect;
+                                  VpData->PrivateDr3Target = target;
+                                  VpData->PrivateDr3OneShot = TRUE;
+                                  page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                  page->Result.Value0 = static_cast<UINT64>(
+                                      InterlockedCompareExchange64(&VpData->PrivateDr3Hits, 0, 0));
+                              }
+                          }
+                          else if (page->Command.CommandId == LmvDebugCommandQueryKiDr3Once)
+                          {
+                              page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                              page->Result.Value0 = static_cast<UINT64>(
+                                  InterlockedCompareExchange64(&VpData->PrivateDr3Hits, 0, 0));
+                              page->Result.Value1 = VpData->PrivateDr3LastRip;
+                              page->Result.Value2 = VpData->PrivateDr3LastDr6;
+                              page->Result.Value3 = VpData->PrivateDr3LastCr3;
+                              page->Result.Flags = static_cast<ULONG>(
+                                  VpData->GuestVmcb.StateSaveArea.Dr7);
+                          }
+                          else if (page->Command.CommandId == LmvDebugCommandQueryKiDr3Args)
+                          {
+                              page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                              page->Result.Value0 = VpData->PrivateDr3LastRcx;
+                              page->Result.Value1 = VpData->PrivateDr3LastRdx;
+                              page->Result.Value2 = VpData->PrivateDr3LastR8;
+                              page->Result.Value3 = VpData->PrivateDr3LastR9;
+                              page->Result.Flags =
+                                  (static_cast<ULONG>(VpData->ProcessorGroup) << 16) |
+                                  VpData->ProcessorNumber;
+                          }
+                          else if (page->Command.CommandId == LmvDebugCommandQueryKiDr3Frame)
+                          {
+                              page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                              page->Result.Value0 = VpData->PrivateDr3LastRsp;
+                              page->Result.Value1 = VpData->PrivateDr3LastRflags;
+                              page->Result.Value2 = VpData->PrivateDr3LastRax;
+                              page->Result.Value3 = VpData->PrivateDr3LastRbp;
+                          }
+
+                         else if (page->Command.CommandId == LmvDebugCommandRegisterKiExits)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             UINT64 base = page->Command.Argument0;
+                             UINT64 end = page->Command.Argument1;
+                             UINT64 capture = page->Command.Argument2;
+                             UINT64 commit = page->Command.Argument3;
+                             if (shared->KiGuestRetired || shared->KiGuestRegistered ||
+                                 shared->KiSessionEnabled || shared->KiArmedProcessors || shared->KiInFlight ||
+                                 shared->DebugHook.State != 0 || g_DebugAttached ||
+                                 (base >> 48) != 0xffff || end <= base || (end >> 48) != 0xffff ||
+                                 capture < base || capture >= end || commit < base || commit >= end || capture == commit)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_INVALID_DEVICE_STATE);
+                             else
+                             {
+                                 shared->KiGuestBase = base;
+                                 shared->KiGuestEnd = end;
+                                 shared->KiCaptureExit = capture;
+                                 shared->KiCommitExit = commit;
+                                 InterlockedExchange(&shared->KiGuestRegistered, 1);
+                                 g_HostDriverObject->DriverUnload = nullptr;
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandQueryKiDrain)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             page->Result.Value0 = InterlockedCompareExchange64(&shared->KiInFlight, 0, 0);
+                             page->Result.Value1 = InterlockedCompareExchange(&shared->KiArmedProcessors, 0, 0);
+                             page->Result.Value2 = (shared->KiGuestRegistered ? LMV_KI_DRAIN_REGISTERED : 0) |
+                                 (shared->KiSessionEnabled ? LMV_KI_DRAIN_ENABLED : 0) |
+                                 (shared->KiGuestRetired ? LMV_KI_DRAIN_RETIRED : 0);
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandRetireKiGuest)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             if (!LmvKiDrainComplete(
+                                 InterlockedCompareExchange64(&shared->KiInFlight, 0, 0),
+                                 InterlockedCompareExchange(&shared->KiArmedProcessors, 0, 0),
+                                 shared->KiSessionEnabled ? LMV_KI_DRAIN_ENABLED : 0) ||
+                                 shared->DebugHook.ExecuteProbe || shared->DebugHook.State != 0 || g_DebugAttached)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                             else
+                             {
+                                 InterlockedExchange(&shared->KiGuestRetired, 1);
+                                 InterlockedExchange(&shared->KiGuestRegistered, 0);
+                                 shared->KiSessionEventStub = 0;
+                                 shared->KiSessionPassStub = 0;
+                                 shared->KiSessionEntry = 0;
+                                 shared->KiCaptureExit = 0;
+                                 shared->KiCommitExit = 0;
+                                 shared->KiPassExit = 0;
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandStartKiSession)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             int capabilities[4];
+                             __cpuid(capabilities, 0x80000008);
+                             ULONG physicalBits = capabilities[0] & 0xff;
+                             if (!shared->KiGuestRegistered || shared->KiGuestRetired ||
+                                 InterlockedCompareExchange64(&shared->KiInFlight, 0, 0) != 0 ||
+                                 InterlockedCompareExchange(&shared->KiArmedProcessors, 0, 0) != 0 ||
+                                 physicalBits < 32 || physicalBits > 52 ||
+                                 page->Command.Argument0 == 0 ||
+                                 (page->Command.Argument1 >> 48) != 0xffff ||
+                                 (page->Command.Argument2 >> 48) != 0xffff ||
+                                 (page->Command.Argument3 >> 48) != 0xffff ||
+                                 page->Command.Argument2 < shared->KiGuestBase ||
+                                 page->Command.Argument2 >= shared->KiGuestEnd ||
+                                 page->Command.Argument3 < shared->KiGuestBase ||
+                                 page->Command.Argument3 + 4 >= shared->KiGuestEnd ||
+                                 InterlockedCompareExchange(&shared->KiSessionEnabled, 0, 0) != 0 ||
+                                 InterlockedCompareExchange(&g_DebugAttached, 0, 0) != 0)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                             else
+                             {
+                                 shared->KiSessionCr3Mask = ((1ull << physicalBits) - 1) & ~0xfffull;
+                                 shared->KiSessionCr3 = page->Command.Argument0 & shared->KiSessionCr3Mask;
+                                 shared->KiSessionEntry = page->Command.Argument1;
+                                 shared->KiSessionEventStub = page->Command.Argument2;
+                                 shared->KiSessionPassStub = page->Command.Argument3;
+                                 shared->KiPassExit = page->Command.Argument3 + 1;
+                                 KeMemoryBarrier();
+                                 InterlockedExchange(&shared->KiSessionEnabled, 1);
+                                 g_HostDriverObject->DriverUnload = nullptr;
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandStopKiSession)
+                         {
+                             InterlockedExchange(&VpData->HostStackLayout.SharedVpData->KiSessionEnabled, 0);
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandAttachProcess)
+                         {
+                             ULONG processId = static_cast<ULONG>(page->Command.Argument0);
+                             if (processId == 0)
+                                 page->Result.Status = LMV_CPUID_RESULT_INVALID_ARGUMENT;
+                             else if (InterlockedCompareExchange(&g_DebugAttached, 0, 0) != 0)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                             else
+                             {
+                                 g_DebugProcessId = processId;
+                                 KeMemoryBarrier();
+                                 InterlockedExchange(&g_DebugAttached, 1);
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 page->Result.Value0 = processId;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandDetachProcess)
+                         {
+                             ULONG processId = static_cast<ULONG>(page->Command.Argument0);
+                             ULONG attachedProcessId = g_DebugProcessId;
+                             if (InterlockedCompareExchange(&g_DebugAttached, 0, 0) == 0 ||
+                                 (processId != 0 && processId != attachedProcessId))
+                                 page->Result.Status = static_cast<ULONG>(STATUS_NOT_FOUND);
+                             else if (InterlockedCompareExchange(&
+                                 VpData->HostStackLayout.SharedVpData->DebugHook.State, 0, 0) != 0)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                             else
+                             {
+                                 g_DebugProcessId = 0;
+                                 KeMemoryBarrier();
+                                 InterlockedExchange(&g_DebugAttached, 0);
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandQueryState)
+                         {
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             page->Result.Value0 = InterlockedCompareExchange(&g_DebugAttached, 0, 0);
+                             page->Result.Value1 = g_DebugProcessId;
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandInstallNptHook)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             PLMV_DBG_NPT_HOOK_REQUEST request = &page->DebugHookRequest;
+                             if (InterlockedCompareExchange(&g_DebugAttached, 0, 0) == 0 ||
+                                 request->ProcessId == 0 ||
+                                 request->ProcessId != g_DebugProcessId ||
+                                 request->GuestPhysicalAddress == 0)
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_INVALID_PARAMETER);
+                             }
+                             else if (InterlockedCompareExchange(&sharedVpData->DebugHook.State, 0, 0) != 0)
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                             }
+                             else if (!SvInstallNptDebugHook(
+                                         sharedVpData, request->ProcessId,
+                                         request->GuestPhysicalAddress, request->PatchOffset,
+                                         request->PatchBytes, request->PatchLength, nullptr))
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_UNSUCCESSFUL);
+                             }
+                             else
+                             {
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 page->Result.Value0 = request->Address;
+                                 page->Result.Value1 = request->GuestPhysicalAddress;
+                                 page->Result.Value2 = sharedVpData->DebugHook.OriginalHostPhysicalAddress;
+                                 page->Result.Value3 = sharedVpData->DebugHook.ShadowHostPhysicalAddress;
+                                 VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandArmExecProbe)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             UINT64 processId = page->Command.Argument0;
+                             if (processId == 0 || processId != g_DebugProcessId ||
+                                 InterlockedCompareExchange(&g_DebugAttached, 0, 0) == 0)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_ACCESS_DENIED);
+                             else if (!SvInstallNptExecProbe(
+                                          sharedVpData, static_cast<ULONG>(processId),
+                                          page->Command.Argument1, page->Command.Argument2,
+                                          page->Command.Argument3,
+                                          page->DebugHookRequest.Address))
+                                 page->Result.Status = static_cast<ULONG>(STATUS_UNSUCCESSFUL);
+                             else
+                             {
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandRemoveNptHook)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             if (sharedVpData->DebugHook.ExecuteProbe != 0 ||
+                                 InterlockedCompareExchange(&sharedVpData->DebugHook.State, 0, 0) == 0)
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_NOT_FOUND);
+                             }
+                             else if (page->Command.Argument0 != 0 &&
+                                      page->Command.Argument0 != sharedVpData->DebugHook.ProcessId)
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_NOT_FOUND);
+                             }
+                             else if (!SvRemoveNptDebugHook(sharedVpData, nullptr))
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_UNSUCCESSFUL);
+                             }
+                             else
+                             {
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandDisarmExecProbe)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             if (sharedVpData->DebugHook.ExecuteProbe != 1 ||
+                                 page->Command.Argument0 != sharedVpData->DebugHook.ProcessId)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_NOT_FOUND);
+                             else if (!SvRemoveNptDebugHook(sharedVpData, nullptr))
+                                 page->Result.Status = static_cast<ULONG>(STATUS_UNSUCCESSFUL);
+                             else
+                             {
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandTranslateNpt)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             UINT64 hostPhysicalAddress = 0;
+                             page->Result.Status = SvTranslateNpt2Mb(
+                                 sharedVpData, page->Command.Argument0,
+                                 &hostPhysicalAddress) ?
+                                 LMV_CPUID_RESULT_SUCCESS :
+                                 static_cast<ULONG>(STATUS_INVALID_ADDRESS);
+                             page->Result.Value0 = hostPhysicalAddress;
+                         }                         else if (page->Command.CommandId == LmvDebugCommandReleaseNptHookRegion)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             page->Result.Status = SvReleaseNptDebugHookRegion(sharedVpData) ?
+                                 LMV_CPUID_RESULT_SUCCESS : static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                         }                         else if (page->Command.CommandId == LmvCpuidCommandQueryNptStats)
+                        {
+                            PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                VpData->HostStackLayout.SharedVpData;
+                            PHYSICAL_ADDRESS sharedPagePa = MmGetPhysicalAddress(
+                                &sharedVpData->SharedPage);
+                            page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                            page->Result.Value0 = static_cast<UINT64>(
+                                InterlockedCompareExchange64(
+                                    &sharedVpData->VmExitTotal, 0, 0));
+                            page->Result.Value1 = static_cast<UINT64>(
+                                InterlockedCompareExchange64(
+                                    &sharedVpData->NpfTotal, 0, 0));
+                            page->Result.Value2 = sharedVpData->ProcessorCount;
+                            page->Result.Value3 = sharedPagePa.QuadPart;
+                        }
+                        else if (page->Command.CommandId >= LmvNptCommandRegisterPage &&
+                                 page->Command.CommandId <= LmvNptCommandReleaseRegion)
+                        {
+                            PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                VpData->HostStackLayout.SharedVpData;
+                            UINT64 guestPhysicalAddress = page->Command.Argument0;
+                            PNPT_TEST_PAGE nptPage = nullptr;
+                            UINT64 hostPhysicalAddress = 0;
+                            ULONG operation = 0;
+                            ULONG nptStatus = LMV_NPT_TEST_STATUS_INVALID_ARGUMENT;
+
+                            switch (page->Command.CommandId)
+                            {
+                            case LmvNptCommandRegisterPage:
+                                operation = LMV_NPT_TEST_OPERATION_REGISTER_PAGE;
+                                break;
+                            case LmvNptCommandReadQword:
+                                operation = LMV_NPT_TEST_OPERATION_READ_QWORD;
+                                break;
+                            case LmvNptCommandRemapPage:
+                                operation = LMV_NPT_TEST_OPERATION_REMAP_PAGE;
+                                break;
+                            case LmvNptCommandRestorePage:
+                                operation = LMV_NPT_TEST_OPERATION_RESTORE_PAGE;
+                                break;
+                            case LmvNptCommandFlushTlb:
+                                operation = LMV_NPT_TEST_OPERATION_FLUSH_TLB;
+                                break;
+                            case LmvNptCommandArmWriteWatch:
+                                operation = LMV_NPT_TEST_OPERATION_ARM_WRITE_WATCH;
+                                break;
+                            case LmvNptCommandQueryWriteWatch:
+                                operation = LMV_NPT_TEST_OPERATION_QUERY_WRITE_WATCH;
+                                break;
+                            case LmvNptCommandDisarmWriteWatch:
+                                operation = LMV_NPT_TEST_OPERATION_DISARM_WRITE_WATCH;
+                                break;
+                            case LmvNptCommandReleaseRegion:
+                                operation = LMV_NPT_TEST_OPERATION_RELEASE_REGION;
+                                break;
+                            default:
+                                break;
+                            }
+
+                            switch (operation)
+                            {
+                            case LMV_NPT_TEST_OPERATION_REGISTER_PAGE:
+                                nptStatus = SvRegisterNptTestPage(sharedVpData, guestPhysicalAddress) ?
+                                    LMV_NPT_TEST_STATUS_SUCCESS : LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                break;
+                            case LMV_NPT_TEST_OPERATION_READ_QWORD:
+                                nptPage = SvFindNptTestPage(sharedVpData, guestPhysicalAddress);
+                                if ((guestPhysicalAddress & (PAGE_SIZE - 1)) == 0 &&
+                                    nptPage != nullptr &&
+                                    InterlockedCompareExchange(&nptPage->State,
+                                                               NPT_TEST_STATE_MAPPED,
+                                                               NPT_TEST_STATE_MAPPED) == NPT_TEST_STATE_MAPPED &&
+                                    SvTranslateNpt2Mb(sharedVpData, guestPhysicalAddress, &hostPhysicalAddress) &&
+                                    hostPhysicalAddress == nptPage->BackingPhysicalAddress)
+                                {
+                                    page->Result.Value0 = *reinterpret_cast<volatile UINT64*>(nptPage->BackingPage);
+                                    page->Result.Value1 = hostPhysicalAddress;
+                                    nptStatus = LMV_NPT_TEST_STATUS_SUCCESS;
+                                }
+                                else
+                                {
+                                    nptStatus = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_REMAP_PAGE:
+                                if ((guestPhysicalAddress & (PAGE_SIZE - 1)) == 0 &&
+                                    SvSetNptTestPageMapping(sharedVpData, guestPhysicalAddress, TRUE))
+                                {
+                                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                                    nptPage = SvFindNptTestPage(sharedVpData, guestPhysicalAddress);
+                                    hostPhysicalAddress = nptPage != nullptr ? nptPage->BackingPhysicalAddress : 0;
+                                    page->Result.Value1 = hostPhysicalAddress;
+                                    nptStatus = LMV_NPT_TEST_STATUS_SUCCESS;
+                                }
+                                else
+                                {
+                                    nptStatus = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_RESTORE_PAGE:
+                                nptStatus = SvSetNptTestPageMapping(sharedVpData, guestPhysicalAddress, FALSE) ?
+                                    LMV_NPT_TEST_STATUS_SUCCESS : LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                if (nptStatus == LMV_NPT_TEST_STATUS_SUCCESS)
+                                {
+                                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_FLUSH_TLB:
+                                VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                                nptStatus = LMV_NPT_TEST_STATUS_SUCCESS;
+                                break;
+                            case LMV_NPT_TEST_OPERATION_ARM_WRITE_WATCH:
+                                nptStatus = SvArmNptTestWriteWatch(sharedVpData, guestPhysicalAddress) ?
+                                    LMV_NPT_TEST_STATUS_SUCCESS : LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                if (nptStatus == LMV_NPT_TEST_STATUS_SUCCESS)
+                                {
+                                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_QUERY_WRITE_WATCH:
+                                nptPage = SvFindNptTestPage(sharedVpData, guestPhysicalAddress);
+                                if (nptPage != nullptr)
+                                {
+                                    page->Result.Value0 = static_cast<UINT64>(InterlockedCompareExchange64(&nptPage->WriteNpfCount, 0, 0));
+                                    page->Result.Value1 = static_cast<UINT64>(InterlockedCompareExchange64(&nptPage->WriteFaultGpa, 0, 0));
+                                    nptStatus = LMV_NPT_TEST_STATUS_SUCCESS;
+                                }
+                                else
+                                {
+                                    nptStatus = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_DISARM_WRITE_WATCH:
+                                nptStatus = SvDisarmNptTestWriteWatch(sharedVpData, guestPhysicalAddress) ?
+                                    LMV_NPT_TEST_STATUS_SUCCESS : LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                if (nptStatus == LMV_NPT_TEST_STATUS_SUCCESS)
+                                {
+                                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_RELEASE_REGION:
+                                nptStatus = SvReleaseNptTestRegion(sharedVpData, guestPhysicalAddress) ?
+                                    LMV_NPT_TEST_STATUS_SUCCESS : LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                break;
+                            default:
+                                break;
+                            }
+                            page->Result.Status = nptStatus;
+                        }
+                        else
+                        {
+                            page->Result.Status = LMV_CPUID_RESULT_UNSUPPORTED;
+                        }
+                        KeMemoryBarrier();
+                        page->Result.State = LMV_SHARED_STATE_COMPLETE;
+                        KeMemoryBarrier();
+                        InterlockedExchange(
+                            reinterpret_cast<volatile LONG*>(&page->State),
+                            LMV_SHARED_STATE_COMPLETE);
+                        status = page->Result.Status;
+                        flags = page->Result.Flags;
+                    }
                     break;
+
+                case LmvCpuidCommandFlushNptTlb:
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    status = LMV_CPUID_RESULT_SUCCESS;
+                    break;
+
+                case LmvCpuidCommandSyncKiSession:
+                {
+                    PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                    if (shared->KiGuestRetired)
+                    {
+                        status = static_cast<ULONG>(STATUS_DELETE_PENDING);
+                        break;
+                    }
+                    if (InterlockedCompareExchange(&shared->KiSessionEnabled, 0, 0) != 0)
+                    {
+                        if (VpData->PrivateDr3Target != 0 && !VpData->PrivateDr3Persistent)
+                            status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                        else
+                        {
+                            if (!VpData->PrivateDr3Persistent)
+                                InterlockedIncrement(&shared->KiArmedProcessors);
+                            VpData->PrivateDr3Persistent = TRUE;
+                            VpData->PrivateDr3OneShot = FALSE;
+                            VpData->PrivateDr3Target = shared->KiSessionEntry;
+                            VpData->GuestVmcb.StateSaveArea.Dr7 =
+                                (VpData->GuestShadowDr7 & ~0xF00000C0ULL) | 0x40;
+                            status = LMV_CPUID_RESULT_SUCCESS;
+                        }
+                    }
+                    else
+                    {
+                        if (VpData->PrivateDr3Persistent)
+                        {
+                            VpData->PrivateDr3Target = 0;
+                            VpData->PrivateDr3Persistent = FALSE;
+                            InterlockedDecrement(&shared->KiArmedProcessors);
+                            VpData->GuestVmcb.StateSaveArea.Dr7 = VpData->GuestShadowDr7 & ~0xF00000C0ULL;
+                        }
+                        status = LMV_CPUID_RESULT_SUCCESS;
+                    }
+                    break;
+                }
+
+                case LmvCpuidCommandReleaseKiGuest:
+                {
+                    PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                    if (!shared->KiGuestRetired || shared->KiGuestRegistered ||
+                        !LmvKiDrainComplete(InterlockedCompareExchange64(&shared->KiInFlight, 0, 0),
+                            InterlockedCompareExchange(&shared->KiArmedProcessors, 0, 0),
+                            shared->KiSessionEnabled ? LMV_KI_DRAIN_ENABLED : 0))
+                        status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                    else
+                    {
+                        InterlockedExchange(&shared->KiGuestReleased, 1);
+                        g_HostDriverObject->DriverUnload = SvDriverUnload;
+                        status = LMV_CPUID_RESULT_SUCCESS;
+                    }
+                    break;
+                }
+                case LmvCpuidCommandQuerySharedPage:
+                {
+                    PHYSICAL_ADDRESS pagePa = MmGetPhysicalAddress(
+                        &VpData->HostStackLayout.SharedVpData->SharedPage);
+                    registers[0] = LMV_CPUID_RESULT_SUCCESS;
+                    registers[1] = static_cast<int>(pagePa.LowPart);
+                    registers[2] = static_cast<int>(pagePa.HighPart);
+                    registers[3] = LMV_SHARED_PAGE_MAGIC;
+                    SvDebugPrint("Shared page: VA=%p HPA=%llx Magic=%08x Version=%u Size=%u State=%u\n",
+                                 &VpData->HostStackLayout.SharedVpData->SharedPage,
+                                 pagePa.QuadPart,
+                                 VpData->HostStackLayout.SharedVpData->SharedPage.Magic,
+                                 VpData->HostStackLayout.SharedVpData->SharedPage.Version,
+                                 VpData->HostStackLayout.SharedVpData->SharedPage.Size,
+                                 VpData->HostStackLayout.SharedVpData->SharedPage.State);
+                    directResult = TRUE;
+                    break;
+                }
 
                 default:
                     status = LMV_CPUID_RESULT_UNSUPPORTED;
@@ -663,10 +1334,13 @@ SvHandleCpuid (
             }
         }
 
-        registers[0] = static_cast<int>(status);
-        registers[1] = static_cast<int>(flags);
-        registers[2] = static_cast<int>(LMV_CPUID_PROTOCOL_VERSION);
-        registers[3] = static_cast<int>(sequence);
+        if (directResult == FALSE)
+        {
+            registers[0] = static_cast<int>(status);
+            registers[1] = static_cast<int>(flags);
+            registers[2] = static_cast<int>(LMV_CPUID_PROTOCOL_VERSION);
+            registers[3] = static_cast<int>(sequence);
+        }
     }
     else if (static_cast<UINT32>(leaf) == LMV_NPT_TEST_CPUID)
     {
@@ -867,7 +1541,12 @@ SvHandleCpuid (
             // Unload itself if the request is from the kernel mode.
             //
             attribute.AsUInt16 = VpData->GuestVmcb.StateSaveArea.SsAttrib;
-            if (attribute.Fields.Dpl == DPL_SYSTEM)
+            if (attribute.Fields.Dpl == DPL_SYSTEM &&
+                !VpData->HostStackLayout.SharedVpData->KiGuestRegistered &&
+                (!VpData->HostStackLayout.SharedVpData->KiGuestRetired ||
+                    VpData->HostStackLayout.SharedVpData->KiGuestReleased) &&
+                !VpData->HostStackLayout.SharedVpData->KiSessionEnabled &&
+                InterlockedCompareExchange64(&VpData->HostStackLayout.SharedVpData->KiInFlight, 0, 0) == 0)
             {
                 GuestContext->ExitVm = TRUE;
             }
@@ -1048,6 +1727,65 @@ SvHandleVmrun (
     SvInjectGeneralProtectionException(VpData);
 }
 
+extern "C"
+VOID
+NTAPI
+SvEnterGuestDebugState(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    __writedr(3, VpData->PrivateDr3Target != 0 ?
+        VpData->PrivateDr3Target : VpData->OriginalHostDr3);
+    __writedr(7, VpData->OriginalHostDr7);
+}
+
+extern "C"
+VOID
+NTAPI
+SvLeaveGuestDebugState(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    __writedr(3, VpData->OriginalHostDr3);
+    __writedr(7, VpData->OriginalHostDr7);
+}
+static UINT64* SvGuestDebugOperand(PVIRTUAL_PROCESSOR_DATA vp, PGUEST_REGISTERS regs, ULONG index)
+{
+    switch (index & 0xf)
+    {
+    case 0: return &regs->Rax; case 1: return &regs->Rcx; case 2: return &regs->Rdx;
+    case 3: return &regs->Rbx; case 4: return &vp->GuestVmcb.StateSaveArea.Rsp;
+    case 5: return &regs->Rbp; case 6: return &regs->Rsi; case 7: return &regs->Rdi;
+    case 8: return &regs->R8; case 9: return &regs->R9; case 10: return &regs->R10;
+    case 11: return &regs->R11; case 12: return &regs->R12; case 13: return &regs->R13;
+    case 14: return &regs->R14; case 15: return &regs->R15; default: return nullptr;
+    }
+}
+
+static VOID SvHandleReservedDebugRegister(PVIRTUAL_PROCESSOR_DATA vp, PGUEST_REGISTERS regs)
+{
+    UINT64 exitCode = vp->GuestVmcb.ControlArea.ExitCode;
+    UINT64* operand = SvGuestDebugOperand(vp, regs,
+        static_cast<ULONG>(vp->GuestVmcb.ControlArea.ExitInfo1 & 0xf));
+    if (operand == nullptr)
+    {
+        SvInjectGeneralProtectionException(vp);
+        return;
+    }
+    switch (exitCode)
+    {
+    case VMEXIT_DR3_WRITE: vp->GuestShadowDr3 = *operand; break;
+    case VMEXIT_DR3_READ: *operand = vp->GuestShadowDr3; break;
+    case VMEXIT_DR7_WRITE:
+        vp->GuestShadowDr7 = *operand;
+        vp->GuestVmcb.StateSaveArea.Dr7 = (vp->GuestShadowDr7 & ~0xF00000C0ULL) |
+            (vp->PrivateDr3Target != 0 ? 0x40ULL : 0);
+        break;
+    case VMEXIT_DR7_READ: *operand = vp->GuestShadowDr7; break;
+    default: SvInjectGeneralProtectionException(vp); return;
+    }
+    vp->GuestVmcb.StateSaveArea.Rip = vp->GuestVmcb.ControlArea.NRip;
+}
 /*!
     @brief          C-level entry point of the host code called from SvLaunchVm.
 
@@ -1089,11 +1827,13 @@ SvHandleVmExit (
         VpData->NptWatchRetryCount = 0;
     }
     InterlockedIncrement64(&VpData->VmExitCount);
+    InterlockedIncrement64(&VpData->HostStackLayout.SharedVpData->VmExitTotal);
 
     //
     // Load some host state that are not loaded on #VMEXIT.
     //
     __svm_vmload(VpData->HostStackLayout.HostVmcbPa);
+    SvLeaveGuestDebugState(VpData);
 
     NT_ASSERT(VpData->HostStackLayout.Reserved1 == MAXUINT64);
 
@@ -1132,6 +1872,124 @@ SvHandleVmExit (
     //
     switch (VpData->GuestVmcb.ControlArea.ExitCode)
     {
+    case VMEXIT_EXCEPTION_DE:
+    {
+        EVENTINJ event;
+
+        SvDebugPrint("#DE VMEXIT: CPU=%hu:%hu RIP=%llx RSP=%llx CR3=%llx RAX=%llx\n",
+                     VpData->ProcessorGroup,
+                     VpData->ProcessorNumber,
+                     VpData->GuestVmcb.StateSaveArea.Rip,
+                     VpData->GuestVmcb.StateSaveArea.Rsp,
+                     VpData->GuestVmcb.StateSaveArea.Cr3,
+                     GuestRegisters->Rax);
+
+        event.AsUInt64 = 0;
+        event.Fields.Vector = 0;
+        event.Fields.Type = 3;
+        event.Fields.Valid = 1;
+        VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+        break;
+    }
+    case VMEXIT_DR3_READ:
+    case VMEXIT_DR3_WRITE:
+    case VMEXIT_DR7_READ:
+    case VMEXIT_DR7_WRITE:
+        SvHandleReservedDebugRegister(VpData, GuestRegisters);
+        break;
+    case VMEXIT_EXCEPTION_DB:
+    {
+        UINT64 debugStatus = VpData->GuestVmcb.StateSaveArea.Dr6;
+        if ((debugStatus & (1ULL << 13)) != 0)
+            VpData->GuestShadowDr7 &= ~(1ULL << 13);
+        if (VpData->PrivateDr3Target != 0 &&
+            (debugStatus & 8) != 0 &&
+            VpData->GuestVmcb.StateSaveArea.Rip == VpData->PrivateDr3Target)
+        {
+            if (VpData->PrivateDr3Persistent)
+            {
+                PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                BOOLEAN target = InterlockedCompareExchange(&shared->KiSessionEnabled, 0, 0) != 0 &&
+                    (VpData->GuestVmcb.StateSaveArea.Cr3 & shared->KiSessionCr3Mask) == shared->KiSessionCr3 &&
+                    (GuestRegisters->R9 & 0xff) == UserMode;
+                InterlockedIncrement64(&shared->KiInFlight);
+                VpData->GuestVmcb.StateSaveArea.Rip = target ?
+                    shared->KiSessionEventStub : shared->KiSessionPassStub;
+            }
+            else if (VpData->PrivateDr3OneShot)
+            {
+                VpData->PrivateDr3LastRip = VpData->GuestVmcb.StateSaveArea.Rip;
+                VpData->PrivateDr3LastDr6 = debugStatus;
+                VpData->PrivateDr3LastCr3 = VpData->GuestVmcb.StateSaveArea.Cr3;
+                VpData->PrivateDr3LastRcx = GuestRegisters->Rcx;
+                VpData->PrivateDr3LastRdx = GuestRegisters->Rdx;
+                VpData->PrivateDr3LastR8 = GuestRegisters->R8;
+                VpData->PrivateDr3LastR9 = GuestRegisters->R9;
+                VpData->PrivateDr3LastRsp = VpData->GuestVmcb.StateSaveArea.Rsp;
+                VpData->PrivateDr3LastRflags = VpData->GuestVmcb.StateSaveArea.Rflags;
+                VpData->PrivateDr3LastRax = GuestRegisters->Rax;
+                VpData->PrivateDr3LastRbp = GuestRegisters->Rbp;
+                VpData->GuestVmcb.StateSaveArea.Dr7 =
+                    VpData->GuestShadowDr7 & ~0xF00000C0ULL;
+                VpData->PrivateDr3Target = 0;
+                VpData->PrivateDr3OneShot = FALSE;
+                if (VpData->PrivateDr3RedirectRip != 0)
+                    VpData->GuestVmcb.StateSaveArea.Rip = VpData->PrivateDr3RedirectRip;
+                VpData->PrivateDr3RedirectRip = 0;
+            }
+            InterlockedIncrement64(&VpData->PrivateDr3Hits);
+            VpData->GuestVmcb.StateSaveArea.Dr6 = debugStatus & ~8ULL;
+            VpData->GuestVmcb.StateSaveArea.Rflags |= 0x10000ULL;
+            if ((debugStatus & 0xE007) == 0)
+                break;
+        }
+        EVENTINJ event;
+        event.AsUInt64 = 0;
+        event.Fields.Vector = 1;
+        event.Fields.Type = 3;
+        event.Fields.Valid = 1;
+        VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+        break;
+    }
+    case VMEXIT_VMMCALL:
+    {
+        PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+        UINT64 rip = VpData->GuestVmcb.StateSaveArea.Rip;
+        UINT64 rsp = VpData->GuestVmcb.StateSaveArea.Rsp;
+        if (VpData->GuestVmcb.StateSaveArea.Cpl != 0 || !shared->KiGuestRegistered ||
+            InterlockedCompareExchange64(&shared->KiInFlight, 0, 0) <= 0)
+        {
+            SvInjectGeneralProtectionException(VpData);
+            break;
+        }
+        if (rip == shared->KiCaptureExit && !VpData->KiExitPending)
+        {
+            VpData->KiExitRax = GuestRegisters->Rax;
+            VpData->KiExitRflags = VpData->GuestVmcb.StateSaveArea.Rflags;
+            VpData->KiExitRsp = rsp;
+            VpData->KiExitPending = TRUE;
+            VpData->GuestVmcb.StateSaveArea.Rflags &= ~(0x200ULL | 0x100ULL);
+            VpData->GuestVmcb.StateSaveArea.Rip = rip + 3;
+        }
+        else if (rip == shared->KiCommitExit && VpData->KiExitPending &&
+            rsp == VpData->KiExitRsp + 8 &&
+            LmvKiExitTargetValid(GuestRegisters->Rax, shared->KiGuestBase, shared->KiGuestEnd))
+        {
+            VpData->GuestVmcb.StateSaveArea.Rip = GuestRegisters->Rax;
+            GuestRegisters->Rax = VpData->KiExitRax;
+            VpData->GuestVmcb.StateSaveArea.Rflags = VpData->KiExitRflags;
+            VpData->KiExitPending = FALSE;
+            InterlockedDecrement64(&shared->KiInFlight);
+        }
+        else if (rip == shared->KiPassExit)
+        {
+            VpData->GuestVmcb.StateSaveArea.Rip = shared->KiSessionEntry + 2;
+            InterlockedDecrement64(&shared->KiInFlight);
+        }
+        else
+            SvInjectGeneralProtectionException(VpData);
+        break;
+    }
     case VMEXIT_CPUID:
         SvHandleCpuid(VpData, &guestContext);
         break;
@@ -1143,6 +2001,7 @@ SvHandleVmExit (
         break;
     case VMEXIT_NPF:
         InterlockedIncrement64(&VpData->NpfCount);
+        InterlockedIncrement64(&VpData->HostStackLayout.SharedVpData->NpfTotal);
         SvDebugPrint("NPF: CPU=%hu:%hu GPA=%llx Info1=%llx Info2=%llx RIP=%llx\n",
                      VpData->ProcessorGroup,
                      VpData->ProcessorNumber,
@@ -1150,7 +2009,15 @@ SvHandleVmExit (
                      VpData->GuestVmcb.ControlArea.ExitInfo1,
                      VpData->GuestVmcb.ControlArea.ExitInfo2,
                      VpData->GuestVmcb.StateSaveArea.Rip);
-        if (SvHandleNptTestWriteFault(VpData) == FALSE)
+        if (SvHandleNptExecProbe(
+                VpData->HostStackLayout.SharedVpData,
+                VpData->GuestVmcb.ControlArea.ExitInfo2,
+                VpData->GuestVmcb.ControlArea.ExitInfo1,
+                &VpData->GuestVmcb.StateSaveArea.Rip))
+        {
+            VpData->GuestVmcb.ControlArea.TlbControl = 1;
+        }
+        else if (SvHandleNptTestWriteFault(VpData) == FALSE)
         {
             SV_DEBUG_BREAK();
 #pragma prefast(suppress : __WARNING_USE_OTHER_FUNCTION, "不可恢复的 NPF。")
@@ -1205,6 +2072,8 @@ SvHandleVmExit (
         // execute random kernel-code in the host context.
         //
         _disable();
+        __writedr(3, VpData->GuestShadowDr3);
+        __writedr(7, VpData->GuestShadowDr7);
         __svm_stgi();
 
         //
@@ -1374,8 +2243,13 @@ SvPrepareForVirtualization (
     // processor attempts to enter the guest mode. See "Canonicalization and
     // Consistency Checks" on "VMRUN Instruction".
     //
+    VpData->GuestVmcb.ControlArea.InterceptException |= 1u << 0;
+    VpData->GuestVmcb.ControlArea.InterceptDrRead |= (1u << 3) | (1u << 7);
+    VpData->GuestVmcb.ControlArea.InterceptDrWrite |= (1u << 3) | (1u << 7);
+    VpData->GuestVmcb.ControlArea.InterceptException |= 1u << 1;
     VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_CPUID;
     VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMRUN;
+    VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMMCALL;
 
     //
     // Also, configure to trigger #VMEXIT on MSR access as configured by the
@@ -1437,6 +2311,13 @@ SvPrepareForVirtualization (
     VpData->GuestVmcb.StateSaveArea.Cr2 = __readcr2();
     VpData->GuestVmcb.StateSaveArea.Cr3 = __readcr3();
     VpData->GuestVmcb.StateSaveArea.Cr4 = __readcr4();
+    VpData->GuestVmcb.StateSaveArea.Dr6 = __readdr(6);
+    VpData->GuestVmcb.StateSaveArea.Dr7 = __readdr(7);
+    VpData->OriginalHostDr3 = __readdr(3);
+    VpData->OriginalHostDr7 = VpData->GuestVmcb.StateSaveArea.Dr7;
+    VpData->GuestShadowDr3 = VpData->OriginalHostDr3;
+    VpData->GuestShadowDr7 = VpData->OriginalHostDr7;
+    VpData->GuestVmcb.StateSaveArea.Dr7 &= ~0xF00000C0ULL;
     VpData->GuestVmcb.StateSaveArea.Rflags = ContextRecord->EFlags;
     VpData->GuestVmcb.StateSaveArea.Rsp = ContextRecord->Rsp;
     VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
@@ -2039,7 +2920,9 @@ SvIsSvmSupported (
     // Feature Identification".
     //
     __cpuid(registers, CPUID_SVM_FEATURES);
-    if ((registers[3] & CPUID_FN8000_000A_EDX_NP) == 0)
+    if ((registers[3] & (CPUID_FN8000_000A_EDX_NP |
+                         CPUID_FN8000_000A_EDX_DECODE_ASSISTS)) !=
+        (CPUID_FN8000_000A_EDX_NP | CPUID_FN8000_000A_EDX_DECODE_ASSISTS))
     {
         goto Exit;
     }
@@ -2115,6 +2998,14 @@ SvVirtualizeAllProcessors (
         goto Exit;
     }
 
+    sharedVpData->SharedPage.Magic = LMV_SHARED_PAGE_MAGIC;
+    sharedVpData->SharedPage.Version = LMV_CPUID_PROTOCOL_VERSION;
+    sharedVpData->SharedPage.Size = sizeof(LMV_SHARED_PAGE);
+    sharedVpData->SharedPage.State = LMV_SHARED_STATE_FREE;
+    sharedVpData->VmExitTotal = 0;
+    sharedVpData->NpfTotal = 0;
+    sharedVpData->ProcessorCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+
     for (ULONG index = 0; index < RTL_NUMBER_OF(sharedVpData->NptTestRegions); ++index)
     {
         PNPT_TEST_REGION region = &sharedVpData->NptTestRegions[index];
@@ -2125,6 +3016,18 @@ SvVirtualizeAllProcessors (
             status = STATUS_INVALID_ADDRESS;
             goto Exit;
         }
+    }
+    sharedVpData->DebugRegion.PtesPhysicalAddress =
+        MmGetPhysicalAddress(&sharedVpData->DebugRegion.Ptes[0]).QuadPart;
+    sharedVpData->DebugHook.ShadowHostPhysicalAddress =
+        MmGetPhysicalAddress(&sharedVpData->DebugHook.ShadowPage[0]).QuadPart;
+    if (sharedVpData->DebugRegion.PtesPhysicalAddress == 0 ||
+        (sharedVpData->DebugRegion.PtesPhysicalAddress & (PAGE_SIZE - 1)) != 0 ||
+        sharedVpData->DebugHook.ShadowHostPhysicalAddress == 0 ||
+        (sharedVpData->DebugHook.ShadowHostPhysicalAddress & (PAGE_SIZE - 1)) != 0)
+    {
+        status = STATUS_INVALID_ADDRESS;
+        goto Exit;
     }
     for (ULONG index = 0; index < RTL_NUMBER_OF(sharedVpData->NptTestPages); ++index)
     {
@@ -2234,6 +3137,7 @@ DriverEntry (
 
     callbackRegistration = nullptr;
     DriverObject->DriverUnload = SvDriverUnload;
+    g_HostDriverObject = DriverObject;
 
     //
     // Opts-in no-execute (NX) nonpaged pool when available for security. By

@@ -15,6 +15,7 @@ MACHINE_FRAME_SIZE          equ     28h
 .code
 
 extern SvHandleVmExit : proc
+extern SvEnterGuestDebugState : proc
 
 ;
 ;   @brief      Saves all general purpose registers to the stack.
@@ -95,6 +96,24 @@ SvLV10: ;
         ;                 0x...ff8 Reserved1         ;
         ; ----
         ;
+        push rax
+        push rcx
+        push rdx
+        push r8
+        push r9
+        push r10
+        push r11
+        sub rsp, 28h
+        mov rcx, [rsp + 70h]
+        call SvEnterGuestDebugState
+        add rsp, 28h
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdx
+        pop rcx
+        pop rax
         mov rax, [rsp]  ; RAX <= VpData->HostStackLayout.GuestVmcbPa
         vmload rax      ; load previously saved guest state from VMCB
 
