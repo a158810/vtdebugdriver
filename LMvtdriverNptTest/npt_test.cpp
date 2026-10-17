@@ -1,6 +1,6 @@
 #include <ntddk.h>
-#include "lmv_npt_test_shared.h"
-#include "lmv_control_shared.h"
+#include "../src/shared/lmv_npt_test_shared.h"
+#include "../src/shared/lmv_control_shared.h"
 
 extern "C"
 VOID

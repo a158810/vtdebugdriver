@@ -19,7 +19,7 @@
 enum class BreakpointType {
     Software,       // INT3 (0xCC), written through the driver
     Hardware,       // DR0-DR3 (not supported by driver yet)
-    Memory          // guard page (not supported yet)
+    Memory          // DR2 data watchpoint (transparent mode only)
 };
 
 enum class HardwareBreakCondition {
@@ -105,6 +105,11 @@ public:
     bool StepInto(DWORD tid);
     bool StepOver(DWORD tid);
 
+    // ---- transparent mode ----
+    bool SetDebugMode(ULONG mode);                   // Set LMV_DEBUG_MODE_INTERACTIVE or LMV_DEBUG_MODE_TRANSPARENT
+    bool PollHostEvents(HOST_EXCEPTION_EVENT& evt);  // Non-blocking poll for transparent mode events
+    ULONG GetDebugMode() const { return m_debugMode; }
+
     // ---- breakpoints ----
     uint32_t SetSoftwareBreakpoint(uint64_t addr);
     uint32_t SetHardwareBreakpoint(uint64_t addr, HardwareBreakCondition cond);
@@ -152,6 +157,7 @@ private:
     bool SetRipAndTrap(DWORD tid, uint64_t rip);
     bool HandleSoftwareBreakpoint(const DBG_EVENT_INFO& evt);
     bool HandleSingleStep(const DBG_EVENT_INFO& evt);
+    bool ControlDr2Watch(ULONG operation, const Breakpoint& breakpoint, uint64_t* hits = nullptr);
 
     bool GetDriverContext(DWORD tid, DBG_CONTEXT& dc);
     bool SetDriverContext(DWORD tid, const DBG_CONTEXT& dc);
@@ -187,6 +193,7 @@ private:
     HANDLE              m_hEventDevice;    // dedicated handle for the blocking GetEvent worker
     ULONG               m_driverVersion;   // last successful ping reply
     ULONG               m_driverFlags;
+    ULONG               m_debugMode;       // LMV_DEBUG_MODE_INTERACTIVE or LMV_DEBUG_MODE_TRANSPARENT
 };
 
 // ============================================================================

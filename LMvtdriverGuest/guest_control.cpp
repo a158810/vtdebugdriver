@@ -7,8 +7,8 @@
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
-#include "../lmv_control_shared.h"
-#include "../ki_session_lifecycle.hpp"
+#include "../src/shared/lmv_control_shared.h"
+#include "../src/shared/ki_session_lifecycle.hpp"
 #include "exec_relocator.hpp"
 #include "ki_replay.hpp"
 #include "ki_stub_plan.hpp"

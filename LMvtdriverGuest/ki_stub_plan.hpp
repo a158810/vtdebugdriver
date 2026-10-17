@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../lmv_control_shared.h"
+#include "../src/shared/lmv_control_shared.h"
 
 #include <cstddef>
 #include <cstdint>

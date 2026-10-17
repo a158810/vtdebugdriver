@@ -2,74 +2,140 @@
 #include "resource.h"
 #include <winres.h>
 
-IDD_MAIN_DIALOG DIALOG 0, 0, 700, 500
+IDD_MAIN_DIALOG DIALOG 0, 0, 700, 550
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 CAPTION "lmdbgr3"
 FONT 9, "MS Shell Dlg"
 BEGIN
-    // ---- Row 1: execution control ----
+    // ---- Row 1: Global controls (always visible) ----
     PUSHBUTTON    "Open...",   IDC_BTN_OPEN,       5,   5,   50,  20
-    PUSHBUTTON    "Attach",    IDC_BTN_ATTACH,     60,  5,   50,  20
-    PUSHBUTTON    "Detach",    IDC_BTN_DETACH,     115, 5,   50,  20
-    PUSHBUTTON    "Stop",      IDC_BTN_STOP,       170, 5,   45,  20
-    PUSHBUTTON    "Break",     IDC_BTN_BREAK,      220, 5,   45,  20
-    PUSHBUTTON    "Run",       IDC_BTN_RUN,        270, 5,   45,  20
-    PUSHBUTTON    "Go",        IDC_BTN_GO,         320, 5,   45,  20
-    PUSHBUTTON    "Step In",   IDC_BTN_STEP_INTO,  370, 5,   50,  20
-    PUSHBUTTON    "Step Over", IDC_BTN_STEP_OVER,  425, 5,   50,  20
+    PUSHBUTTON    "Ping",      IDC_BTN_PING,       60,  5,   40,  20
+    LTEXT         "Driver: -", IDC_DRV_STATUS,     105, 8,   120, 12
+    LTEXT         "Status: Idle", IDC_STATUS_TEXT, 230, 8,   120, 12
+    LTEXT         "PID:",      -1,                 360, 8,   22,  12
+    EDITTEXT      IDC_PID_EDIT,                    385, 5,   50,  18, ES_NUMBER
+    LTEXT         "Path:",     -1,                 440, 8,   24,  12
+    EDITTEXT      IDC_PATH_EDIT,                   465, 5,   180, 18, ES_AUTOHSCROLL
+    PUSHBUTTON    "Browse",    IDC_BTN_BROWSE,     650, 5,   45,  20
 
-    // ---- Row 2: target selection / status ----
-    LTEXT          "PID:",      -1, 5,  31, 22, 12
-    EDITTEXT       IDC_PID_EDIT,    30, 28,  50,  18, ES_NUMBER
-    LTEXT          "Path:",     -1, 88, 31,  24, 12
-    EDITTEXT       IDC_PATH_EDIT,   115, 28, 250, 18, ES_AUTOHSCROLL
-    PUSHBUTTON     "Browse",    IDC_BTN_BROWSE, 370, 27, 55, 20
-    PUSHBUTTON     "Ping",      IDC_BTN_PING,   430, 28, 40, 20
+    // ---- Tab Control ----
+    CONTROL       "", IDC_TAB_CONTROL, "SysTabControl32", TCS_TABS | WS_TABSTOP, 5, 30, 690, 510
 
-    LTEXT          "Driver: -", IDC_DRV_STATUS, 475, 31, 110, 12
-    LTEXT          "Status: Idle", IDC_STATUS_TEXT, 590, 31, 105, 12
+    // ============================================================================
+    // Tab 1: Interactive Mode (交互调试)
+    // ============================================================================
+
+    // ---- Execution control (Tab 1) ----
+    PUSHBUTTON    "Attach",    IDC_BTN_ATTACH,     15,  55,   50,  20
+    PUSHBUTTON    "Detach",    IDC_BTN_DETACH,     70,  55,   50,  20
+    PUSHBUTTON    "Stop",      IDC_BTN_STOP,       125, 55,   45,  20
+    PUSHBUTTON    "Break",     IDC_BTN_BREAK,      175, 55,   45,  20
+    PUSHBUTTON    "Run",       IDC_BTN_RUN,        225, 55,   45,  20
+    PUSHBUTTON    "Go",        IDC_BTN_GO,         275, 55,   45,  20
+    PUSHBUTTON    "Step In",   IDC_BTN_STEP_INTO,  325, 55,   50,  20
+    PUSHBUTTON    "Step Over", IDC_BTN_STEP_OVER,  380, 55,   50,  20
 
     // ---- Disassembly (left / top) ----
-    GROUPBOX       "Disassembly",    IDC_GRP_DISASM, 5,   52,  420, 190
-    LTEXT          "Addr:",     -1, 14,  69,  24,  12
-    EDITTEXT       IDC_DISASM_ADDR,  42, 66,  110, 18, ES_AUTOHSCROLL
-    LTEXT          "Count:",    -1, 158, 69,  26,  12
-    EDITTEXT       IDC_DISASM_COUNT, 186, 66,  40,  18, ES_NUMBER
-    PUSHBUTTON     "Go",        IDC_DISASM_REFRESH, 230, 65,  34,  20
-    LISTBOX        IDC_DISASM_LIST,  12,  88,  402, 148, LBS_NOTIFY | WS_VSCROLL | WS_HSCROLL
+    GROUPBOX      "RIP Disassembly", IDC_GRP_DISASM, 15,   82,  420, 165
+    LTEXT         "RIP:",      IDC_DISASM_ADDR_LABEL, 24, 99, 24, 12
+    EDITTEXT      IDC_DISASM_ADDR,                  52,   96,  110, 18, ES_AUTOHSCROLL
+    LTEXT         "Count:",    IDC_DISASM_COUNT_LABEL, 168, 99, 26, 12
+    EDITTEXT      IDC_DISASM_COUNT,                 196,  96,  40,  18, ES_NUMBER
+    PUSHBUTTON    "Go",        IDC_DISASM_REFRESH,  240,  95,  34,  20
+    LISTBOX       IDC_DISASM_LIST,                  22,   118, 402, 120, LBS_NOTIFY | WS_VSCROLL | WS_HSCROLL
 
     // ---- Registers (right / top) ----
-    GROUPBOX       "Registers",      IDC_GRP_REGS, 430, 52,  265, 190
-    EDITTEXT       IDC_REGS_EDIT,    440, 68,  245, 140, ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL | ES_AUTOVSCROLL
-    PUSHBUTTON     "Refresh",    IDC_REGS_REFRESH,   470, 214, 60, 22
-    PUSHBUTTON     "Apply",      IDC_BTN_REGS_APPLY, 535, 214, 60, 22
+    GROUPBOX      "Registers",      IDC_GRP_REGS,   440, 82,  250, 165
+    EDITTEXT      IDC_REGS_EDIT,                    450, 98,  230, 115, ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL | ES_AUTOVSCROLL
+    PUSHBUTTON    "Refresh",    IDC_REGS_REFRESH,   480, 219, 60, 22
+    PUSHBUTTON    "Apply",      IDC_BTN_REGS_APPLY, 545, 219, 60, 22
 
     // ---- Breakpoints (left / bottom) ----
-    GROUPBOX       "Breakpoints",    IDC_GRP_BREAKPOINTS, 5,   244, 420, 120
-    LTEXT          "Addr:",     -1, 14,  264, 24,  12
-    EDITTEXT       IDC_BP_ADDR,      40,  261, 130, 18, ES_AUTOHSCROLL
-    LTEXT          "Type:",     -1, 176, 264, 22,  12
-    COMBOBOX       IDC_BP_TYPE,      200, 261, 60,  80, CBS_DROPDOWNLIST | WS_VSCROLL
-    LTEXT          "Cond:",     -1, 264, 264, 24,  12
-    COMBOBOX       IDC_BP_COND,      290, 261, 60,  80, CBS_DROPDOWNLIST | WS_VSCROLL
-    LTEXT          "Size:",     -1, 354, 264, 22,  12
-    EDITTEXT       IDC_BP_SIZE,      378, 261, 40,  18, ES_NUMBER
-    PUSHBUTTON     "Set BP",    IDC_BTN_BP_SET,     12,  285, 45, 20
-    PUSHBUTTON     "Del",       IDC_BTN_BP_DEL,     62,  285, 35, 20
-    PUSHBUTTON     "En",        IDC_BTN_BP_ENABLE,  102, 285, 25, 20
-    PUSHBUTTON     "Dis",       IDC_BTN_BP_DISABLE, 132, 285, 30, 20
-    LISTBOX        IDC_BREAKPOINT_LIST, 12, 312, 402, 45, LBS_NOTIFY | WS_VSCROLL | WS_HSCROLL
+    GROUPBOX      "Breakpoints",    IDC_GRP_BREAKPOINTS, 15,  254, 420, 120
+    LTEXT         "Addr:",     IDC_BP_ADDR_LABEL, 24, 274, 24, 12
+    EDITTEXT      IDC_BP_ADDR,                      50,   271, 130, 18, ES_AUTOHSCROLL
+    LTEXT         "Type:",     IDC_BP_TYPE_LABEL, 186, 274, 22, 12
+    COMBOBOX      IDC_BP_TYPE,                      210,  271, 60,  80, CBS_DROPDOWNLIST | WS_VSCROLL
+    LTEXT         "Cond:",     IDC_BP_COND_LABEL, 274, 274, 24, 12
+    COMBOBOX      IDC_BP_COND,                      300,  271, 60,  80, CBS_DROPDOWNLIST | WS_VSCROLL
+    LTEXT         "Size:",     IDC_BP_SIZE_LABEL, 364, 274, 22, 12
+    EDITTEXT      IDC_BP_SIZE,                      388,  271, 40,  18, ES_NUMBER
+    PUSHBUTTON    "Set BP",    IDC_BTN_BP_SET,      22,   295, 45, 20
+    PUSHBUTTON    "Del",       IDC_BTN_BP_DEL,      72,   295, 35, 20
+    PUSHBUTTON    "En",        IDC_BTN_BP_ENABLE,   112,  295, 25, 20
+    PUSHBUTTON    "Dis",       IDC_BTN_BP_DISABLE,  142,  295, 30, 20
+    LISTBOX       IDC_BREAKPOINT_LIST,              22,   322, 402, 45, LBS_NOTIFY | WS_VSCROLL | WS_HSCROLL
 
     // ---- Memory (right / bottom) ----
-    GROUPBOX       "Memory",         IDC_GRP_MEMORY, 430, 244, 265, 120
-    LTEXT          "Addr:",     -1, 441, 264, 24,  12
-    EDITTEXT       IDC_MEMORY_ADDR,  467, 261, 105, 18, ES_AUTOHSCROLL
-    LTEXT          "Size:",     -1, 578, 264, 22,  12
-    EDITTEXT       IDC_MEMORY_SIZE,  602, 261, 40,  18, ES_NUMBER
-    PUSHBUTTON     "Read",      IDC_BTN_MEM_READ,   646, 260, 35,  20
-    EDITTEXT       IDC_MEMORY_EDIT,  440, 288, 245, 68, ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL
+    GROUPBOX      "Memory",         IDC_GRP_MEMORY, 440, 254, 250, 120
+    LTEXT         "Addr:",     IDC_MEMORY_ADDR_LABEL, 451, 274, 24, 12
+    EDITTEXT      IDC_MEMORY_ADDR,                  477, 271, 105, 18, ES_AUTOHSCROLL
+    LTEXT         "Size:",     IDC_MEMORY_SIZE_LABEL, 588, 274, 22, 12
+    EDITTEXT      IDC_MEMORY_SIZE,                  612, 271, 40,  18, ES_NUMBER
+    PUSHBUTTON    "Read",      IDC_BTN_MEM_READ,    656, 270, 25,  20
+    EDITTEXT      IDC_MEMORY_EDIT,                  450, 298, 230, 68, ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL
 
-    // ---- Output (full width, bottom) ----
-    GROUPBOX       "Output",         IDC_GRP_OUTPUT, 5,   368, 690, 126
-    EDITTEXT       IDC_OUTPUT_EDIT,  12,  386, 676, 100, ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL
+    // ---- Output (full width, bottom - Tab 1) ----
+    GROUPBOX      "Output",         IDC_GRP_OUTPUT, 15,  382, 675, 70
+    EDITTEXT      IDC_OUTPUT_EDIT,                  22,  398, 661, 48, ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL
+
+    // ============================================================================
+    // Tab 2: Transparent Mode (透明监控)
+    // ============================================================================
+
+    // ---- Execution control (Tab 2) ----
+    PUSHBUTTON    "Attach",    IDC_BTN_ATTACH_T,    15,  55,   50,  20
+    PUSHBUTTON    "Detach",    IDC_BTN_DETACH_T,    70,  55,   50,  20
+    PUSHBUTTON    "Show ASM",  IDC_BTN_SHOW_DISASM,    125, 55, 60, 20
+    PUSHBUTTON    "Export",    IDC_BTN_EXPORT_EVENTS,  240, 55, 50, 20
+    PUSHBUTTON    "Clear",     IDC_BTN_CLEAR_EVENTS,   295, 55, 45, 20
+
+    // ---- Event List (main area) ----
+    GROUPBOX      "Event List", IDC_GRP_TRANSPARENT, 15, 82, 675, 180
+    CONTROL       "", IDC_TRANSPARENT_EVENT_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP, 22, 98, 661, 155
+
+    // ---- Statistics (left bottom) ----
+    GROUPBOX      "Statistics", IDC_GRP_STATISTICS, 15, 270, 330, 100
+    LTEXT         "Total Events:", IDC_STAT_TOTAL_LABEL, 25, 288, 70, 12
+    LTEXT         "0", IDC_STAT_TOTAL,              100, 288, 80, 12
+    LTEXT         "Dropped:", IDC_STAT_DROPPED_LABEL, 25, 305, 70, 12
+    LTEXT         "0", IDC_STAT_DROPPED,            100, 305, 80, 12
+    LTEXT         "Errors:", IDC_STAT_ERRORS_LABEL, 25, 322, 70, 12
+    LTEXT         "0", IDC_STAT_ERRORS,             100, 322, 80, 12
+    LTEXT         "Rate:", IDC_STAT_RATE_LABEL, 25, 339, 70, 12
+    LTEXT         "0 ev/s", IDC_STAT_RATE,          100, 339, 80, 12
+
+    // ---- Event Details (right bottom) ----
+    GROUPBOX      "Event Details", IDC_GRP_EVENT_DETAILS, 355, 270, 335, 100
+    EDITTEXT      IDC_EVENT_DETAILS_EDIT,           365, 288, 315, 74, ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL
+
+    // ---- DR2 data watch (transparent mode) ----
+    GROUPBOX      "DR2 Data Watch", IDC_GRP_DR2_WATCH, 15, 376, 675, 56
+    LTEXT         "Addr:", IDC_DR2_ADDR_LABEL,       24, 397, 25, 12
+    EDITTEXT      IDC_DR2_ADDR_EDIT,                  50, 393, 150, 18, ES_AUTOHSCROLL
+    LTEXT         "Len:", IDC_DR2_LEN_LABEL,        206, 397, 20, 12
+    COMBOBOX      IDC_DR2_LEN_COMBO,                 229, 393, 54, 80, CBS_DROPDOWNLIST | WS_VSCROLL
+    LTEXT         "Access:", IDC_DR2_COND_LABEL,    291, 397, 36, 12
+    COMBOBOX      IDC_DR2_COND_COMBO,                330, 393, 112, 80, CBS_DROPDOWNLIST | WS_VSCROLL
+    PUSHBUTTON    "Watch", IDC_BTN_DR2_WATCH,        448, 392, 55, 22
+    PUSHBUTTON    "Stop", IDC_BTN_DR2_STOP,          507, 392, 48, 22
+    LTEXT         "Idle", IDC_DR2_STATUS,            560, 397, 120, 12
+    // ---- Output (full width, bottom - Tab 2) ----
+    GROUPBOX      "Output",         IDC_GRP_OUTPUT_T, 15,  438, 675, 70
+    EDITTEXT      IDC_OUTPUT_EDIT_T,                 22,  454, 661, 48, ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL
+
+END
+
+IDD_DISASM_DIALOG DIALOGEX 0, 0, 560, 360
+STYLE DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "RIP Disassembly"
+FONT 9, "MS Shell Dlg"
+BEGIN
+    LTEXT         "RIP:",       IDC_DISASM_WINDOW_ADDR_LABEL,  10, 12, 24, 12
+    EDITTEXT      IDC_DISASM_WINDOW_ADDR,                         38,  9, 185, 18, ES_AUTOHSCROLL
+    LTEXT         "Count:",     IDC_DISASM_WINDOW_COUNT_LABEL, 232, 12, 30, 12
+    EDITTEXT      IDC_DISASM_WINDOW_COUNT,                      266,  9, 40, 18, ES_NUMBER
+    PUSHBUTTON    "Disassemble", IDC_DISASM_WINDOW_REFRESH,     314,  8, 82, 20
+    LISTBOX       IDC_DISASM_WINDOW_LIST,                        10, 36, 540, 314, LBS_NOTIFY | WS_VSCROLL | WS_HSCROLL
 END

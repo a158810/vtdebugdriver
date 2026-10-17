@@ -7,7 +7,7 @@
 #else
     #include <windows.h>
     #include <winioctl.h>
-    #include "..\\..\\lmv_control_shared.h"
+    #include "..\\..\\src\\shared\\lmv_control_shared.h"
     typedef LONG NTSTATUS;
 #endif
 

@@ -1,6 +1,6 @@
 #include <ntifs.h>
 #include <ntimage.h>
-#include "../lmv_control_shared.h"
+#include "../src/shared/lmv_control_shared.h"
 
 static NTSTATUS LmvReadKernelImage(_In_ ULONGLONG Address, _Out_writes_bytes_(Length) PVOID Buffer,
     _In_ SIZE_T Length)

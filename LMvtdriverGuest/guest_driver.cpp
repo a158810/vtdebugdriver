@@ -1,7 +1,7 @@
-#include <ntifs.h>
+﻿#include <ntifs.h>
 #include <intrin.h>
-#include "../lmv_control_shared.h"
-#include "../ki_session_lifecycle.hpp"
+#include "../src/shared/lmv_control_shared.h"
+#include "../src/shared/ki_session_lifecycle.hpp"
 #include "guest_memory.hpp"
 #include "guest_layout.hpp"
 #include "static_probe_sample.hpp"
@@ -63,6 +63,7 @@ static LMV_KI_DR3_EVENT_SLOT g_KiDr3Events[kKiDr3EventCapacity];
 static volatile LONG g_KiDr3EventSequence;
 static PFILE_OBJECT g_KiDr3EventOwner;
 static ULONG g_KiDr3ControllerProcessId;
+static volatile ULONG g_KiSessionMode = LMV_DEBUG_MODE_INTERACTIVE;  // Default: Interactive mode
 static ULONG g_KiDr3EventGeneration;
 static BOOLEAN g_KiDr3QueueSmokeActive;
 extern "C" volatile LONG64 g_LmvGuestKiDr3StubHits = 0;
@@ -72,6 +73,7 @@ static PDRIVER_OBJECT g_GuestDriverObject;
 static PEPROCESS g_KiSessionProcess;
 static PFILE_OBJECT g_KiSessionOwner;
 static volatile LONG g_KiSessionActive;
+static volatile LONG g_KiDr2WatchActive;
 static KEVENT g_KiSessionGate;
 static BOOLEAN g_KiGuestRegistered;
 static BOOLEAN g_KiGuestRetired;
@@ -114,7 +116,8 @@ LmvGuestIssueSharedCommand(
     _Out_ PLMV_SHARED_RESULT Result,
     _In_ ULONGLONG ExtraArgument = 0,
     _In_ ULONGLONG Argument2 = 0,
-    _In_ ULONGLONG Argument3 = 0
+    _In_ ULONGLONG Argument3 = 0,
+    _In_ ULONG Flags = 0
     )
 {
     LMV_CPUID_SHARED_PAGE_RESULT pageResult = {};
@@ -167,6 +170,7 @@ LmvGuestIssueSharedCommand(
     page->Command.Argument1 = ExtraArgument;
     page->Command.Argument2 = Argument2;
     page->Command.Argument3 = Argument3;
+    page->Command.Flags = Flags;
     KeMemoryBarrier();
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&page->State), LMV_SHARED_STATE_READY);
 
@@ -2276,13 +2280,141 @@ static NTSTATUS LmvGuestSyncKiSession(PLMV_GUEST_KI_SESSION Session)
         affinity.Mask = 1ull << processor.Number;
         KeSetSystemGroupAffinityThread(&affinity, &previous);
         LMV_CPUID_RESULT result = {};
-        LmvGuestCpuidCall(LmvCpuidCommandSyncKiSession, 0, &result);
+        LmvGuestCpuidCall(LmvCpuidCommandSyncKiSession, Session->Mode, &result);
         KeRevertToUserGroupAffinityThread(&previous);
         if (result.Status == LMV_CPUID_RESULT_SUCCESS)
             ++Session->ProcessorsSeen;
         else
             status = STATUS_UNSUCCESSFUL;
     }
+    return status;
+}
+
+typedef struct _LMV_DR2_SYNC_CONTEXT
+{
+    volatile LONG ProcessorsSeen;
+    volatile LONG Failed;
+    volatile LONG Status;
+} LMV_DR2_SYNC_CONTEXT, *PLMV_DR2_SYNC_CONTEXT;
+
+static ULONG_PTR NTAPI LmvGuestSyncDr2WatchProcessor(ULONG_PTR Context)
+{
+    PLMV_DR2_SYNC_CONTEXT sync = reinterpret_cast<PLMV_DR2_SYNC_CONTEXT>(Context);
+    LMV_CPUID_RESULT result = {};
+    LmvGuestCpuidCall(LmvCpuidCommandSyncDr2Watch, 0, &result);
+    if (result.Status == LMV_CPUID_RESULT_SUCCESS)
+        InterlockedIncrement(&sync->ProcessorsSeen);
+    else
+    {
+        InterlockedExchange(&sync->Failed, 1);
+        InterlockedCompareExchange(&sync->Status, static_cast<LONG>(result.Status), 0);
+    }
+    return 0;
+}
+
+static NTSTATUS LmvGuestSyncDr2WatchProcessors(PLMV_GUEST_DR2_WATCH Watch)
+{
+    LMV_DR2_SYNC_CONTEXT sync = {};
+    Watch->ProcessorsExpected = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    KeIpiGenericCall(LmvGuestSyncDr2WatchProcessor, reinterpret_cast<ULONG_PTR>(&sync));
+    Watch->ProcessorsSeen = static_cast<ULONG>(sync.ProcessorsSeen);
+    if (sync.Failed != 0)
+        return sync.Status != 0 ? static_cast<NTSTATUS>(sync.Status) : STATUS_UNSUCCESSFUL;
+    if (Watch->ProcessorsSeen != Watch->ProcessorsExpected)
+        return STATUS_UNSUCCESSFUL;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS LmvGuestControlDr2Watch(PLMV_GUEST_DR2_WATCH Watch, PFILE_OBJECT FileObject)
+{
+    if (Watch->Version != LMV_CPUID_PROTOCOL_VERSION || Watch->Size != sizeof(*Watch))
+        return STATUS_REVISION_MISMATCH;
+    if (Watch->Operation != LMV_DR2_WATCH_START && Watch->Operation != LMV_DR2_WATCH_STOP)
+        return STATUS_INVALID_PARAMETER;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    NTSTATUS status = KeWaitForSingleObject(&g_KiSessionGate, Executive, KernelMode, FALSE, nullptr);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    if (g_KiSessionOwner != FileObject)
+        status = STATUS_ACCESS_DENIED;
+    else if (g_KiSessionProcess == nullptr || InterlockedCompareExchange(&g_KiSessionActive, 0, 0) == 0)
+        status = STATUS_INVALID_DEVICE_STATE;
+    else if (InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_KiSessionMode), 0, 0) !=
+        LMV_DEBUG_MODE_TRANSPARENT)
+        status = STATUS_INVALID_DEVICE_STATE;
+    else if (Watch->ProcessId != HandleToULong(PsGetProcessId(g_KiSessionProcess)))
+        status = STATUS_ACCESS_DENIED;
+    else if (Watch->Operation == LMV_DR2_WATCH_START &&
+        (InterlockedCompareExchange(&g_KiDr2WatchActive, 0, 0) != 0 ||
+         Watch->ProcessId == 0 || Watch->Address == 0 ||
+         Watch->Address >= 0x0000800000000000ull ||
+         (Watch->Length != 1 && Watch->Length != 2 && Watch->Length != 4 && Watch->Length != 8) ||
+         Watch->Address > 0x00007FFFFFFFFFFFull - (Watch->Length - 1) ||
+         (Watch->Address & (Watch->Length - 1)) != 0 ||
+         (Watch->Condition != LMV_DR2_CONDITION_WRITE &&
+          Watch->Condition != LMV_DR2_CONDITION_READ_WRITE)))
+        status = InterlockedCompareExchange(&g_KiDr2WatchActive, 0, 0) != 0 ?
+            STATUS_DEVICE_BUSY : STATUS_INVALID_PARAMETER;
+    else if (Watch->Operation == LMV_DR2_WATCH_START)
+    {
+        PUCHAR processBytes = reinterpret_cast<PUCHAR>(g_KiSessionProcess);
+        ULONGLONG userCr3 = *reinterpret_cast<volatile ULONGLONG*>(
+            processBytes + LMV_KPROCESS_USER_DIRECTORY_TABLE_BASE_OFFSET);
+        userCr3 &= LMV_PAGE_ADDRESS_MASK;
+
+        LMV_SHARED_RESULT result = {};
+        status = LmvGuestIssueSharedCommand(LmvDebugCommandConfigureDr2Watch,
+            Watch->Address, &result, Watch->Length, Watch->Condition, userCr3, Watch->ProcessId);
+        if (NT_SUCCESS(status))
+        {
+            status = LmvGuestSyncDr2WatchProcessors(Watch);
+            if (NT_SUCCESS(status))
+            {
+                InterlockedExchange(&g_KiDr2WatchActive, 1);
+                Watch->Hits = result.Value0;
+            }
+            else
+            {
+                LMV_SHARED_RESULT rollback = {};
+                NTSTATUS rollbackStatus = LmvGuestIssueSharedCommand(
+                    LmvDebugCommandRemoveDr2Watch, 0, &rollback);
+                if (NT_SUCCESS(rollbackStatus))
+                {
+                    LMV_GUEST_DR2_WATCH syncResult = {};
+                    rollbackStatus = LmvGuestSyncDr2WatchProcessors(&syncResult);
+                }
+                if (!NT_SUCCESS(rollbackStatus))
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                        "[LMvtdriverGuest] DR2 watch rollback failed: status=0x%08X\n",
+                        rollbackStatus);
+            }
+        }
+    }
+    else if (InterlockedCompareExchange(&g_KiDr2WatchActive, 0, 0) == 0)
+    {
+        Watch->Hits = 0;
+        Watch->ProcessorsSeen = 0;
+        Watch->ProcessorsExpected = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+        status = STATUS_SUCCESS;
+    }
+    else
+    {
+        LMV_SHARED_RESULT result = {};
+        status = LmvGuestIssueSharedCommand(LmvDebugCommandRemoveDr2Watch, 0, &result);
+        if (NT_SUCCESS(status))
+        {
+            Watch->Hits = result.Value0;
+            status = LmvGuestSyncDr2WatchProcessors(Watch);
+            if (NT_SUCCESS(status))
+                InterlockedExchange(&g_KiDr2WatchActive, 0);
+        }
+    }
+
+    Watch->Status = static_cast<ULONG>(status);
+    KeSetEvent(&g_KiSessionGate, IO_NO_INCREMENT, FALSE);
     return status;
 }
 
@@ -2325,6 +2457,7 @@ static NTSTATUS LmvGuestStopKiSession(PLMV_GUEST_KI_SESSION Session)
     ++g_KiDr3EventGeneration;
     KeSetEvent(&g_KiDr3EventAvailable, IO_NO_INCREMENT, FALSE);
     ExReleaseFastMutex(&g_KiDr3EventMutex);
+
     LMV_SHARED_RESULT result = {};
     NTSTATUS status = LmvGuestIssueSharedCommand(LmvDebugCommandStopKiSession, 0, &result);
     if (NT_SUCCESS(status))
@@ -2335,6 +2468,13 @@ static NTSTATUS LmvGuestStopKiSession(PLMV_GUEST_KI_SESSION Session)
     status = LmvGuestWaitKiDrain(&drain);
     if (!NT_SUCCESS(status))
         return status;
+    InterlockedExchange(&g_KiDr2WatchActive, 0);
+    LMV_SHARED_RESULT modeResult = {};
+    status = LmvGuestIssueSharedCommand(LmvDebugCommandSetMode, LMV_DEBUG_MODE_INTERACTIVE,
+        &modeResult, LMV_SESSION_IDLE);
+    if (!NT_SUCCESS(status))
+        return status;
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_KiSessionMode), LMV_DEBUG_MODE_INTERACTIVE);
     ExAcquireFastMutex(&g_KiDr3EventMutex);
     PEPROCESS process = g_KiSessionProcess;
     g_KiSessionProcess = nullptr;
@@ -2354,6 +2494,9 @@ static NTSTATUS LmvGuestControlKiSession(PLMV_GUEST_KI_SESSION Session, PFILE_OB
     if (Session->Version != LMV_CPUID_PROTOCOL_VERSION || Session->Size != sizeof(*Session))
         return STATUS_REVISION_MISMATCH;
     if (Session->Operation != LMV_KI_SESSION_START && Session->Operation != LMV_KI_SESSION_STOP)
+        return STATUS_INVALID_PARAMETER;
+    if (Session->Operation == LMV_KI_SESSION_START &&
+        Session->Mode != LMV_DEBUG_MODE_INTERACTIVE && Session->Mode != LMV_DEBUG_MODE_TRANSPARENT)
         return STATUS_INVALID_PARAMETER;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL)
         return STATUS_INVALID_DEVICE_STATE;
@@ -2386,17 +2529,29 @@ static NTSTATUS LmvGuestControlKiSession(PLMV_GUEST_KI_SESSION Session, PFILE_OB
     if (!NT_SUCCESS(status) || info.BytesRead < 2 ||
         info.OriginalBytes[0] != 0x40 || info.OriginalBytes[1] != 0x55)
     {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[LMvtdriverGuest] KiDispatchException query failed: status=0x%08X bytes=%u prologue=%02X%02X\n",
+            status, info.BytesRead,
+            info.BytesRead > 0 ? info.OriginalBytes[0] : 0,
+            info.BytesRead > 1 ? info.OriginalBytes[1] : 0);
         KeSetEvent(&g_KiSessionGate, IO_NO_INCREMENT, FALSE);
         return NT_SUCCESS(status) ? STATUS_NOT_SUPPORTED : status;
     }
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[LMvtdriverGuest] KiDispatchException found at 0x%p\n", (PVOID)info.RoutineAddress);
 
     PEPROCESS process = nullptr;
     status = PsLookupProcessByProcessId(ULongToHandle(Session->ProcessId), &process);
     if (!NT_SUCCESS(status))
     {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[LMvtdriverGuest] PsLookupProcessByProcessId failed for PID %u: status=0x%08X\n",
+            Session->ProcessId, status);
         KeSetEvent(&g_KiSessionGate, IO_NO_INCREMENT, FALSE);
         return status;
     }
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[LMvtdriverGuest] Process lookup succeeded for PID %u\n", Session->ProcessId);
 
     ExAcquireFastMutex(&g_KiDr3EventMutex);
     BOOLEAN busy = g_KiSessionProcess != nullptr || g_KiSessionOwner != nullptr || g_KiDr3EventOwner != nullptr ||
@@ -2415,10 +2570,16 @@ static NTSTATUS LmvGuestControlKiSession(PLMV_GUEST_KI_SESSION Session, PFILE_OB
     }
 
     PUCHAR processBytes = reinterpret_cast<PUCHAR>(process);
-    Session->KernelCr3 = *reinterpret_cast<volatile ULONGLONG*>(
-        processBytes + LMV_KPROCESS_DIRECTORY_TABLE_BASE_OFFSET) & LMV_PAGE_ADDRESS_MASK;
+    ULONGLONG rawCr3 = *reinterpret_cast<volatile ULONGLONG*>(
+        processBytes + LMV_KPROCESS_DIRECTORY_TABLE_BASE_OFFSET);
+    Session->KernelCr3 = rawCr3 & LMV_PAGE_ADDRESS_MASK;
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[LMvtdriverGuest] Read CR3 from offset 0x%X: raw=0x%016llX masked=0x%016llX\n",
+        LMV_KPROCESS_DIRECTORY_TABLE_BASE_OFFSET, rawCr3, Session->KernelCr3);
     if (Session->KernelCr3 == 0)
     {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[LMvtdriverGuest] Invalid CR3 (zero after masking) - possible wrong EPROCESS offset!\n");
         ObDereferenceObject(process);
         KeSetEvent(&g_KiSessionGate, IO_NO_INCREMENT, FALSE);
         return STATUS_INVALID_ADDRESS;
@@ -2427,6 +2588,8 @@ static NTSTATUS LmvGuestControlKiSession(PLMV_GUEST_KI_SESSION Session, PFILE_OB
     Session->KiAddress = info.RoutineAddress;
     if (!g_KiGuestRegistered)
     {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[LMvtdriverGuest] Registering Guest exits with Host...\n");
         g_GuestDriverObject->DriverUnload = nullptr;
         LMV_SHARED_RESULT registration = {};
         ULONGLONG base = reinterpret_cast<ULONGLONG>(g_GuestDriverObject->DriverStart);
@@ -2436,10 +2599,14 @@ static NTSTATUS LmvGuestControlKiSession(PLMV_GUEST_KI_SESSION Session, PFILE_OB
             reinterpret_cast<ULONGLONG>(&LmvGuestKiCommitExit));
         if (!NT_SUCCESS(status))
         {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[LMvtdriverGuest] RegisterKiExits failed: status=0x%08X\n", status);
             ObDereferenceObject(process);
             KeSetEvent(&g_KiSessionGate, IO_NO_INCREMENT, FALSE);
             return status;
         }
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[LMvtdriverGuest] Guest exits registered successfully\n");
         g_KiGuestRegistered = TRUE;
     }
     g_LmvGuestKiSessionResumeRip = info.RoutineAddress + 2;
@@ -2454,13 +2621,58 @@ static NTSTATUS LmvGuestControlKiSession(PLMV_GUEST_KI_SESSION Session, PFILE_OB
     InterlockedExchange(&g_KiSessionActive, 1);
     ExReleaseFastMutex(&g_KiDr3EventMutex);
     g_GuestDriverObject->DriverUnload = nullptr;
+
+    // Set session mode and state (immutable once set)
+    ULONG sessionMode = Session->Mode; // From R3: LMV_DEBUG_MODE_INTERACTIVE or TRANSPARENT
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_KiSessionMode), static_cast<LONG>(sessionMode));
+    ULONG sessionState = (sessionMode == LMV_DEBUG_MODE_TRANSPARENT)
+                         ? LMV_SESSION_TRANSPARENT
+                         : LMV_SESSION_INTERACTIVE;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "[LMvtdriverGuest] Starting Ki session: CR3=0x%016llX Ki=0x%p Mode=%s\n",
+        Session->KernelCr3, (PVOID)info.RoutineAddress,
+        sessionMode == LMV_DEBUG_MODE_TRANSPARENT ? "TRANSPARENT" : "INTERACTIVE");
+
     LMV_SHARED_RESULT result = {};
     status = LmvGuestIssueSharedCommand(LmvDebugCommandStartKiSession,
         Session->KernelCr3, &result, info.RoutineAddress,
         reinterpret_cast<ULONGLONG>(&LmvGuestKiSessionEventStub),
         reinterpret_cast<ULONGLONG>(&LmvGuestKiSessionPassStub));
+
     if (NT_SUCCESS(status))
-        status = LmvGuestSyncKiSession(Session);
+    {
+        // Notify Host of the mode and state
+        LMV_SHARED_RESULT modeResult = {};
+        NTSTATUS modeStatus = LmvGuestIssueSharedCommand(
+            LmvDebugCommandSetMode, sessionMode, &modeResult, sessionState);
+        if (!NT_SUCCESS(modeStatus))
+        {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[LMvtdriverGuest] Failed to set mode in Host: status=0x%08X\n", modeStatus);
+        }
+
+        // Continue with DR3 sync
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "[LMvtdriverGuest] Host session started, syncing DR3 across all CPUs...\n");
+        status = NT_SUCCESS(modeStatus) ? LmvGuestSyncKiSession(Session) : modeStatus;
+        if (!NT_SUCCESS(status))
+        {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[LMvtdriverGuest] DR3 sync failed: status=0x%08X\n", status);
+        }
+        else
+        {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                "[LMvtdriverGuest] Ki session fully active: %u CPUs synced\n",
+                Session->ProcessorsSeen);
+        }
+    }
+    else
+    {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[LMvtdriverGuest] Host StartKiSession failed: status=0x%08X\n", status);
+    }
     if (!NT_SUCCESS(status))
         LmvGuestStopKiSession(Session);
     KeSetEvent(&g_KiSessionGate, IO_NO_INCREMENT, FALSE);
@@ -2527,10 +2739,138 @@ static NTSTATUS LmvGuestControlKiDrain(PLMV_GUEST_KI_DRAIN Drain, PFILE_OBJECT F
     return status;
 }
 
+static VOID LmvGuestCaptureTransparentException(
+    PEXCEPTION_RECORD ExceptionRecord, PVOID ExceptionFrame, PVOID TrapFrame, ULONG FirstChance)
+{
+    HOST_EXCEPTION_EVENT event = {};
+    LARGE_INTEGER systemTime = {};
+    KeQuerySystemTimePrecise(&systemTime);
+    event.Timestamp = static_cast<UINT64>(systemTime.QuadPart);
+    event.ProcessId = HandleToULong(PsGetCurrentProcessId());
+    event.ThreadId = HandleToULong(PsGetCurrentThreadId());
+    event.Cr3 = __readcr3();
+    event.FirstChance = FirstChance;
+    event.CaptureStatus = static_cast<ULONG>(STATUS_INVALID_ADDRESS);
+    KTRAP_FRAME trap = {};
+    KEXCEPTION_FRAME frame = {};
+    EXCEPTION_RECORD record = {};
+    MM_COPY_ADDRESS source = {};
+    SIZE_T copied = 0;
+    if (ExceptionRecord != nullptr && reinterpret_cast<ULONG_PTR>(ExceptionRecord) >= 0xffff800000000000ull)
+    {
+        source.VirtualAddress = ExceptionRecord;
+        NTSTATUS status = MmCopyMemory(&record, source, sizeof(record), MM_COPY_MEMORY_VIRTUAL, &copied);
+        event.CaptureStatus = static_cast<ULONG>(status);
+        if (NT_SUCCESS(status) && copied == sizeof(record) && record.NumberParameters <= 15)
+        {
+            event.ExceptionType = static_cast<ULONG>(record.ExceptionCode);
+            event.ExceptionAddress = reinterpret_cast<UINT64>(record.ExceptionAddress);
+            event.NumberParameters = record.NumberParameters;
+            RtlCopyMemory(event.ExceptionInformation, record.ExceptionInformation,
+                record.NumberParameters * sizeof(UINT64));
+            if (TrapFrame != nullptr && ExceptionFrame != nullptr &&
+                reinterpret_cast<ULONG_PTR>(TrapFrame) >= 0xffff800000000000ull &&
+                reinterpret_cast<ULONG_PTR>(ExceptionFrame) >= 0xffff800000000000ull)
+            {
+                source.VirtualAddress = TrapFrame;
+                copied = 0;
+                status = MmCopyMemory(&trap, source, sizeof(trap), MM_COPY_MEMORY_VIRTUAL, &copied);
+                if (NT_SUCCESS(status) && copied == sizeof(trap))
+                {
+                    source.VirtualAddress = ExceptionFrame;
+                    copied = 0;
+                    status = MmCopyMemory(&frame, source, sizeof(frame), MM_COPY_MEMORY_VIRTUAL, &copied);
+                    if (NT_SUCCESS(status) && copied == sizeof(frame) && (trap.SegCs & 3) == 3 &&
+                        trap.Rip != 0 && trap.Rip < 0x0000800000000000ull &&
+                        trap.Rsp != 0 && trap.Rsp < 0x0000800000000000ull)
+                    {
+                        event.Rip = trap.Rip; event.Rsp = trap.Rsp; event.Rflags = trap.EFlags;
+                        event.Rax = trap.Rax; event.Rcx = trap.Rcx; event.Rdx = trap.Rdx;
+                        event.R8 = trap.R8; event.R9 = trap.R9; event.R10 = trap.R10; event.R11 = trap.R11;
+                        event.Rbx = frame.Rbx; event.Rbp = frame.Rbp; event.Rsi = frame.Rsi; event.Rdi = frame.Rdi;
+                        event.R12 = frame.R12; event.R13 = frame.R13; event.R14 = frame.R14; event.R15 = frame.R15;
+                        event.Dr6 = trap.Dr6;
+                        event.ContextValid = 1;
+                        event.CaptureStatus = STATUS_SUCCESS;
+
+                        // Capture user-mode call stack using direct pointer access
+                        event.StackFrameCount = 0;
+                        event.StackCaptureStatus = 2; // Default: no frames found
+                        if (trap.Rsp != 0 && trap.Rsp < 0x0000800000000000ull)
+                        {
+                            __try
+                            {
+                                const ULONG MAX_STACK_SCAN = 0x2000; // 8KB
+                                PUINT64 stackPtr = reinterpret_cast<PUINT64>(trap.Rsp);
+                                PUINT64 stackEnd = reinterpret_cast<PUINT64>(trap.Rsp + MAX_STACK_SCAN);
+
+                                // Scan stack for user-mode return addresses
+                                while (stackPtr < stackEnd && event.StackFrameCount < HOST_EXCEPTION_MAX_STACK_FRAMES)
+                                {
+                                    UINT64 value = *stackPtr; // Direct pointer read
+                                    if (value > 0x10000 && value < 0x0000800000000000ull)
+                                    {
+                                        event.StackFrames[event.StackFrameCount++] = value;
+                                    }
+                                    stackPtr++;
+                                }
+
+                                event.StackCaptureStatus = (event.StackFrameCount > 0) ? 0 : 2;
+                            }
+                            __except (EXCEPTION_EXECUTE_HANDLER)
+                            {
+                                event.StackCaptureStatus = 1; // Exception during scan
+                            }
+                        }
+                    }
+                    else
+                        event.CaptureStatus = static_cast<ULONG>(NT_SUCCESS(status) ? STATUS_INVALID_PARAMETER : status);
+                }
+                else
+                    event.CaptureStatus = static_cast<ULONG>(NT_SUCCESS(status) ? STATUS_PARTIAL_COPY : status);
+            }
+            else
+                event.CaptureStatus = static_cast<ULONG>(STATUS_INVALID_ADDRESS);
+        }
+        else if (NT_SUCCESS(status))
+            event.CaptureStatus = static_cast<ULONG>(STATUS_PARTIAL_COPY);
+    }
+    ExAcquireFastMutex(&g_CommandMutex);
+    LMV_CPUID_SHARED_PAGE_RESULT pageResult = {};
+    LmvGuestQuerySharedPage(&pageResult);
+    if (pageResult.Status == LMV_CPUID_RESULT_SUCCESS && pageResult.Magic == LMV_SHARED_PAGE_MAGIC)
+    {
+        PHYSICAL_ADDRESS pa = {};
+        pa.LowPart = pageResult.GpaLow;
+        pa.HighPart = pageResult.GpaHigh;
+        PLMV_SHARED_PAGE page = static_cast<PLMV_SHARED_PAGE>(MmMapIoSpace(pa, PAGE_SIZE, MmCached));
+        if (page != nullptr)
+        {
+            if (page->Magic == LMV_SHARED_PAGE_MAGIC && page->Version == LMV_CPUID_PROTOCOL_VERSION &&
+                page->Size == sizeof(LMV_SHARED_PAGE))
+            {
+                RtlCopyMemory(page->Data, &event, sizeof(event));
+                KeMemoryBarrier();
+                LMV_CPUID_RESULT result = {};
+                LmvGuestCpuidCall(LmvCpuidCommandSubmitHostEvent, 0, &result);
+            }
+            MmUnmapIoSpace(page, PAGE_SIZE);
+        }
+    }
+    ExReleaseFastMutex(&g_CommandMutex);
+}
+
 extern "C" BOOLEAN LmvGuestKiSessionException(
     PEXCEPTION_RECORD ExceptionRecord, PVOID ExceptionFrame, PVOID TrapFrame,
     ULONG PreviousMode, ULONG FirstChance)
 {
+    if (PreviousMode == UserMode && g_KiSessionMode == LMV_DEBUG_MODE_TRANSPARENT)
+    {
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL && (__readeflags() & 0x200) != 0 &&
+            g_KiSessionActive && g_KiSessionProcess == PsGetCurrentProcess())
+            LmvGuestCaptureTransparentException(ExceptionRecord, ExceptionFrame, TrapFrame, FirstChance);
+        return FALSE;
+    }
     if (PreviousMode != UserMode || FirstChance == 0 ||
         KeGetCurrentIrql() != PASSIVE_LEVEL || (__readeflags() & 0x200) == 0 ||
         ExceptionRecord == nullptr || ExceptionFrame == nullptr || TrapFrame == nullptr ||
@@ -3177,8 +3517,10 @@ LmvGuestDeviceControl(
     BOOLEAN persistentAllowed = code == IOCTL_LMV_GUEST_KI_SESSION ||
         code == IOCTL_LMV_GUEST_KI_DR3_GET_CONTEXT || code == IOCTL_LMV_GUEST_KI_DR3_SET_CONTEXT ||
         code == IOCTL_LMV_GUEST_KI_DR3_WAIT_EVENT || code == IOCTL_LMV_GUEST_KI_DR3_CONTINUE ||
-        code == LMV_DBG_IOCTL_PING || code == IOCTL_LMV_GUEST_READ_PROCESS_MEMORY ||
-        code == IOCTL_LMV_GUEST_WRITE_PROCESS_MEMORY;
+        code == LMV_DBG_IOCTL_PING || code == IOCTL_LMV_GUEST_POLL_HOST_EVENTS ||
+        code == IOCTL_LMV_GUEST_READ_PROCESS_MEMORY ||
+        code == IOCTL_LMV_GUEST_WRITE_PROCESS_MEMORY ||
+        code == IOCTL_LMV_GUEST_DR2_WATCH;
     if (blocked && !drainRequest)
         status = STATUS_DELETE_PENDING;
     else if (g_KiPersistentOnly && !persistentAllowed)
@@ -3194,7 +3536,100 @@ LmvGuestDeviceControl(
             status = LmvGuestControlKiDrain(drain, stack->FileObject);
             information = sizeof(*drain);
         }
+    }    else if (code == IOCTL_LMV_SET_DEBUG_MODE)
+    {
+        if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
+            status = STATUS_BUFFER_TOO_SMALL;
+        else
+        {
+            ULONG mode = *static_cast<PULONG>(Irp->AssociatedIrp.SystemBuffer);
+            if (mode == LMV_DEBUG_MODE_INTERACTIVE || mode == LMV_DEBUG_MODE_TRANSPARENT)
+            {
+                // Update local mode
+                InterlockedExchange((volatile LONG*)&g_KiSessionMode, mode);
+
+                // Notify Host driver via simple CPUID command (old method)
+                LMV_CPUID_RESULT result = {};
+                LmvGuestCpuidCall(LmvCpuidCommandSyncKiSession, mode, &result);
+
+                if (result.Status != LMV_CPUID_RESULT_SUCCESS)
+                {
+                    status = STATUS_UNSUCCESSFUL;
+                }
+                else
+                {
+                    status = STATUS_SUCCESS;
+                    information = 0;
+                }
+            }
+            else
+            {
+                status = STATUS_INVALID_PARAMETER;
+            }
+        }
+    }    else if (code == IOCTL_LMV_GUEST_POLL_HOST_EVENTS)
+    {
+        // Poll Host event queue for transparent mode
+        if (outputLength < sizeof(HOST_EXCEPTION_EVENT))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            information = 0;
+        }
+        else
+        {
+            KeWaitForSingleObject(&g_KiSessionGate, Executive, KernelMode, FALSE, nullptr);
+            if (g_KiSessionOwner != stack->FileObject)
+                status = STATUS_ACCESS_DENIED;
+            else if (!g_KiSessionActive || g_KiSessionMode != LMV_DEBUG_MODE_TRANSPARENT)
+                status = STATUS_INVALID_DEVICE_STATE;
+            else
+            {
+                ExAcquireFastMutex(&g_CommandMutex);
+                LMV_CPUID_SHARED_PAGE_RESULT pageResult = {};
+                LmvGuestQuerySharedPage(&pageResult);
+                if (pageResult.Status != LMV_CPUID_RESULT_SUCCESS)
+                    status = static_cast<NTSTATUS>(pageResult.Status);
+                else if (pageResult.Magic != LMV_SHARED_PAGE_MAGIC)
+                    status = STATUS_REVISION_MISMATCH;
+                else
+                {
+                    PHYSICAL_ADDRESS pa = {};
+                    pa.LowPart = pageResult.GpaLow;
+                    pa.HighPart = pageResult.GpaHigh;
+                    PLMV_SHARED_PAGE page = static_cast<PLMV_SHARED_PAGE>(
+                        MmMapIoSpace(pa, PAGE_SIZE, MmCached));
+                    if (page == nullptr)
+                        status = STATUS_INSUFFICIENT_RESOURCES;
+                    else
+                    {
+                        if (page->Magic != LMV_SHARED_PAGE_MAGIC ||
+                            page->Version != LMV_CPUID_PROTOCOL_VERSION ||
+                            page->Size != sizeof(LMV_SHARED_PAGE))
+                            status = STATUS_REVISION_MISMATCH;
+                        else
+                        {
+                            LMV_CPUID_RESULT result = {};
+                            LmvGuestCpuidCall(LmvCpuidCommandReadHostEvent, 0, &result);
+                            status = static_cast<NTSTATUS>(result.Status);
+                            if (result.Status == LMV_CPUID_RESULT_SUCCESS && result.Flags == 1)
+                            {
+                                RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, page->Data,
+                                    sizeof(HOST_EXCEPTION_EVENT));
+                                information = sizeof(HOST_EXCEPTION_EVENT);
+                            }
+                            else if (result.Status == LMV_CPUID_RESULT_SUCCESS)
+                                status = STATUS_DATA_ERROR;
+                        }
+                        MmUnmapIoSpace(page, PAGE_SIZE);
+                    }
+                }
+                ExReleaseFastMutex(&g_CommandMutex);
+            }
+            KeSetEvent(&g_KiSessionGate, IO_NO_INCREMENT, FALSE);
+        }
     }
+
+
     else if (code == IOCTL_LMV_GUEST_KI_SESSION)
     {
         if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(LMV_GUEST_KI_SESSION) ||
@@ -3206,6 +3641,20 @@ LmvGuestDeviceControl(
             status = LmvGuestControlKiSession(session, stack->FileObject);
             if (NT_SUCCESS(status))
                 information = sizeof(*session);
+        }
+    }
+    else if (code == IOCTL_LMV_GUEST_DR2_WATCH)
+    {
+        if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(LMV_GUEST_DR2_WATCH) ||
+            outputLength < sizeof(LMV_GUEST_DR2_WATCH))
+            status = STATUS_BUFFER_TOO_SMALL;
+        else
+        {
+            PLMV_GUEST_DR2_WATCH watch =
+                static_cast<PLMV_GUEST_DR2_WATCH>(Irp->AssociatedIrp.SystemBuffer);
+            status = LmvGuestControlDr2Watch(watch, stack->FileObject);
+            if (NT_SUCCESS(status))
+                information = sizeof(*watch);
         }
     }
     else if (code == IOCTL_LMV_GUEST_KI_DR3_GET_CONTEXT || code == IOCTL_LMV_GUEST_KI_DR3_SET_CONTEXT)
@@ -3224,7 +3673,8 @@ LmvGuestDeviceControl(
     else if (g_KiSessionOwner != nullptr &&
         code != IOCTL_LMV_GUEST_KI_DR3_WAIT_EVENT && code != IOCTL_LMV_GUEST_KI_DR3_CONTINUE &&
         code != LMV_DBG_IOCTL_PING &&
-        code != IOCTL_LMV_GUEST_READ_PROCESS_MEMORY && code != IOCTL_LMV_GUEST_WRITE_PROCESS_MEMORY)
+        code != IOCTL_LMV_GUEST_READ_PROCESS_MEMORY && code != IOCTL_LMV_GUEST_WRITE_PROCESS_MEMORY &&
+        code != IOCTL_LMV_GUEST_DR2_WATCH)
         status = STATUS_DEVICE_BUSY;
     else if ((code == IOCTL_LMV_GUEST_KERNEL_EXEC_SMOKE ||
          code == IOCTL_LMV_GUEST_KERNEL_EXEC_STRESS) &&

@@ -1,0 +1,5129 @@
+/*!
+    @file       SimpleSvm.cpp
+
+    @brief      All C code.
+
+    @author     Satoshi Tanda
+
+    @copyright  Copyright (c) 2017-2020, Satoshi Tanda. All rights reserved.
+ */
+#define POOL_NX_OPTIN   1
+#include "svm_core.hpp"
+#include "lmv_npt_test_shared.h"
+#include "npt_manager.hpp"
+#include "lmv_control_shared.h"
+#include "ki_session_lifecycle.hpp"
+
+#include <intrin.h>
+#include <ntifs.h>
+#include <stdarg.h>
+
+EXTERN_C DRIVER_INITIALIZE DriverEntry;
+static DRIVER_UNLOAD SvDriverUnload;
+static CALLBACK_FUNCTION SvPowerCallbackRoutine;
+static volatile LONG g_DebugAttached;
+static volatile ULONG g_DebugProcessId;
+static PDRIVER_OBJECT g_HostDriverObject;
+
+EXTERN_C
+VOID
+_sgdt (
+    _Out_ PVOID Descriptor
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
+_IRQL_requires_same_
+DECLSPEC_NORETURN
+EXTERN_C
+VOID
+NTAPI
+SvLaunchVm (
+    _In_ PVOID HostRsp
+    );
+
+//
+// See "GDTR and IDTR Format-Long Mode"
+//
+#include <pshpack1.h>
+typedef struct _DESCRIPTOR_TABLE_REGISTER
+{
+    UINT16 Limit;
+    ULONG_PTR Base;
+} DESCRIPTOR_TABLE_REGISTER, *PDESCRIPTOR_TABLE_REGISTER;
+static_assert(sizeof(DESCRIPTOR_TABLE_REGISTER) == 10,
+              "DESCRIPTOR_TABLE_REGISTER Size Mismatch");
+#include <poppack.h>
+
+
+
+//
+// See "Long-Mode Segment Descriptors" and some of definitions
+// (eg, "Code-Segment Descriptor-Long Mode")
+//
+typedef struct _SEGMENT_DESCRIPTOR
+{
+    union
+    {
+        UINT64 AsUInt64;
+        struct
+        {
+            UINT16 LimitLow;        // [0:15]
+            UINT16 BaseLow;         // [16:31]
+            UINT32 BaseMiddle : 8;  // [32:39]
+            UINT32 Type : 4;        // [40:43]
+            UINT32 System : 1;      // [44]
+            UINT32 Dpl : 2;         // [45:46]
+            UINT32 Present : 1;     // [47]
+            UINT32 LimitHigh : 4;   // [48:51]
+            UINT32 Avl : 1;         // [52]
+            UINT32 LongMode : 1;    // [53]
+            UINT32 DefaultBit : 1;  // [54]
+            UINT32 Granularity : 1; // [55]
+            UINT32 BaseHigh : 8;    // [56:63]
+        } Fields;
+    };
+} SEGMENT_DESCRIPTOR, *PSEGMENT_DESCRIPTOR;
+static_assert(sizeof(SEGMENT_DESCRIPTOR) == 8,
+              "SEGMENT_DESCRIPTOR Size Mismatch");
+
+typedef struct _SEGMENT_ATTRIBUTE
+{
+    union
+    {
+        UINT16 AsUInt16;
+        struct
+        {
+            UINT16 Type : 4;        // [0:3]
+            UINT16 System : 1;      // [4]
+            UINT16 Dpl : 2;         // [5:6]
+            UINT16 Present : 1;     // [7]
+            UINT16 Avl : 1;         // [8]
+            UINT16 LongMode : 1;    // [9]
+            UINT16 DefaultBit : 1;  // [10]
+            UINT16 Granularity : 1; // [11]
+            UINT16 Reserved1 : 4;   // [12:15]
+        } Fields;
+    };
+} SEGMENT_ATTRIBUTE, *PSEGMENT_ATTRIBUTE;
+typedef struct _GUEST_REGISTERS
+{
+    UINT64 R15;
+    UINT64 R14;
+    UINT64 R13;
+    UINT64 R12;
+    UINT64 R11;
+    UINT64 R10;
+    UINT64 R9;
+    UINT64 R8;
+    UINT64 Rdi;
+    UINT64 Rsi;
+    UINT64 Rbp;
+    UINT64 Rsp;
+    UINT64 Rbx;
+    UINT64 Rdx;
+    UINT64 Rcx;
+    UINT64 Rax;
+} GUEST_REGISTERS, *PGUEST_REGISTERS;
+static_assert(sizeof(SEGMENT_ATTRIBUTE) == 2,
+              "SEGMENT_ATTRIBUTE Size Mismatch");
+
+enum NESTED_SVM_TRACE_ACTION : ULONG
+{
+    NestedTraceEnter = 1,
+    NestedTraceReflect,
+    NestedTraceReject,
+    NestedTraceAbort,
+    NestedTraceMsr,
+    NestedTraceState,
+    NestedTraceGif,
+    NestedTraceNmi
+};
+
+enum NESTED_SVM_FAILURE : ULONG
+{
+    NestedFailureNone,
+    NestedFailurePermission,
+    NestedFailureAddress,
+    NestedFailureInvalidVmcb,
+    NestedFailureUnsupported,
+    NestedFailurePermissionMap,
+    NestedFailureWriteback,
+    NestedFailureUnexpectedExit
+};
+
+struct NESTED_SVM_TRACE_RECORD
+{
+    UINT64 Sequence;
+    ULONG Action;
+    ULONG Failure;
+    UINT64 VmcbGpa;
+    UINT64 HsaveGpa;
+    UINT64 VirtualEfer;
+    UINT64 ExecutionEfer;
+    UINT64 ExitCode;
+    UINT64 ExitInfo1;
+    UINT64 ExitInfo2;
+    UINT64 Rip;
+    UINT64 NRip;
+    UINT64 GuestRax;
+    BOOLEAN L2Active;
+    BOOLEAN VirtualGif;
+};
+
+typedef struct _VIRTUAL_PROCESSOR_DATA
+{
+    union
+    {
+        //
+        //  Low     HostStackLimit[0]                        StackLimit
+        //  ^       ...
+        //  ^       HostStackLimit[KERNEL_STACK_SIZE - 2]    StackBase
+        //  High    HostStackLimit[KERNEL_STACK_SIZE - 1]    StackBase
+        //
+        DECLSPEC_ALIGN(PAGE_SIZE) UINT8 HostStackLimit[KERNEL_STACK_SIZE];
+        struct
+        {
+            UINT8 StackContents[KERNEL_STACK_SIZE - (sizeof(PVOID) * 6) - sizeof(KTRAP_FRAME)];
+            KTRAP_FRAME TrapFrame;
+            UINT64 GuestVmcbPa;     // HostRsp
+            UINT64 HostVmcbPa;
+            struct _VIRTUAL_PROCESSOR_DATA* Self;
+            PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData;
+            UINT64 Padding1;        // To keep HostRsp 16 bytes aligned
+            UINT64 Reserved1;
+        } HostStackLayout;
+    };
+
+    DECLSPEC_ALIGN(PAGE_SIZE) VMCB GuestVmcb;
+    DECLSPEC_ALIGN(PAGE_SIZE) VMCB HostVmcb;
+    DECLSPEC_ALIGN(PAGE_SIZE) VMCB NestedL1Vmcb;
+    DECLSPEC_ALIGN(PAGE_SIZE) VMCB NestedVmcb12;
+    DECLSPEC_ALIGN(PAGE_SIZE) VMCB NestedScratchVmcb;
+    DECLSPEC_ALIGN(PAGE_SIZE) UINT8 HostStateArea[PAGE_SIZE];
+    PVOID NestedMsrPermissionsMap;
+    PVOID NestedL1MsrPermissionsMap;
+    PVOID NestedIoPermissionsMap;
+    UINT64 NestedL1VmcbGpa;
+    UINT64 NestedL1VmrunRip;
+    UINT64 NestedVirtualEfer;
+    UINT64 NestedVirtualVmHsavePa;
+    UINT64 NestedVirtualVmCr;
+    UINT64 NestedL2VirtualEfer;
+    UINT64 NestedL2VirtualVmHsavePa;
+    UINT64 NestedL2VirtualVmCr;
+    UINT64 NestedL2Dr2;
+    UINT64 NestedL2Dr3;
+    UINT64 NestedL2Dr7;
+    BOOLEAN NestedVirtualGif;
+    BOOLEAN NestedL2VirtualGif;
+    BOOLEAN NestedActive;
+    BOOLEAN NestedL1NptEnabled;
+    GUEST_REGISTERS NestedL1Registers;
+    PPHYSICAL_MEMORY_RANGE NestedRamRanges;
+
+
+
+
+
+
+    UINT64 NestedMsrpmPa;
+    UINT64 NestedIopmPa;
+    UINT32 NestedBaseInterceptMisc1;
+    UINT32 NestedL2BaseInterceptMisc1;
+    BOOLEAN NestedL1PendingNmi;
+    BOOLEAN NestedL2PendingNmi;
+    UINT64 NestedTraceSequence;
+    NESTED_SVM_TRACE_RECORD NestedTrace[32];
+    volatile LONG64 VmExitCount;
+    volatile LONG64 NpfCount;
+    UINT64 NptWatchRetryRip;
+    UINT64 NptWatchRetryGpa;
+    ULONG NptWatchRetryCount;
+    UINT64 PrivateDr3Target;
+    UINT64 OriginalHostDr3;
+    UINT64 OriginalHostDr7;
+    UINT64 GuestShadowDr3;
+    UINT64 GuestShadowDr7;
+    UINT64 OriginalHostDr2;
+    UINT64 GuestShadowDr2;
+    BOOLEAN Dr2WatchApplied;
+    volatile LONG64 PrivateDr3Hits;
+    BOOLEAN PrivateDr3OneShot;
+    BOOLEAN PrivateDr3Persistent;
+    BOOLEAN KiExitPending;
+    UINT64 KiExitRax;
+    UINT64 KiExitRflags;
+    UINT64 KiExitRsp;
+    UINT64 PrivateDr3RedirectRip;
+    UINT64 PrivateDr3LastRip;
+    UINT64 PrivateDr3LastDr6;
+    UINT64 PrivateDr3LastCr3;
+    UINT64 PrivateDr3LastRcx;
+    UINT64 PrivateDr3LastRdx;
+    UINT64 PrivateDr3LastR8;
+    UINT64 PrivateDr3LastR9;
+    UINT64 PrivateDr3LastRsp;
+    UINT64 PrivateDr3LastRflags;
+    UINT64 PrivateDr3LastRax;
+    UINT64 PrivateDr3LastRbp;
+    USHORT ProcessorGroup;
+    USHORT ProcessorNumber;
+} VIRTUAL_PROCESSOR_DATA, *PVIRTUAL_PROCESSOR_DATA;
+
+static PVOID volatile g_SvmNestedLastVp;
+static_assert(FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.Self) -
+              FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.GuestVmcbPa) == 0x10,
+              "Self offset mismatch");
+static_assert(FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.Reserved1) -
+              FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.GuestVmcbPa) == 0x28,
+              "Host stack layout mismatch");
+static_assert(sizeof(VIRTUAL_PROCESSOR_DATA) >=
+              KERNEL_STACK_SIZE + PAGE_SIZE * 3 +
+              sizeof(LONG64) * 2 + sizeof(USHORT) * 2,
+              "VIRTUAL_PROCESSOR_DATA Size Mismatch");
+
+static constexpr UINT64 kDr2WatchDr7Mask = 0x0F000030ULL;
+
+static UINT64 SvBuildDr2WatchDr7(PSHARED_VIRTUAL_PROCESSOR_DATA shared)
+{
+    ULONG lengthBits = 0;
+    switch (shared->Dr2WatchLength)
+    {
+    case 2: lengthBits = 1; break;
+    case 4: lengthBits = 3; break;
+    case 8: lengthBits = 2; break;
+    default: lengthBits = 0; break;
+    }
+    return 0x30ULL |
+        (static_cast<UINT64>(shared->Dr2WatchCondition) << 24) |
+        (static_cast<UINT64>(lengthBits) << 26);
+}
+
+static BOOLEAN SvSyncDr2WatchState(PVIRTUAL_PROCESSOR_DATA vp)
+{
+    PSHARED_VIRTUAL_PROCESSOR_DATA shared = vp->HostStackLayout.SharedVpData;
+    UINT64* shadowDr7 = vp->NestedActive ? &vp->NestedL2Dr7 : &vp->GuestShadowDr7;
+    BOOLEAN enabled = InterlockedCompareExchange(&shared->Dr2WatchEnabled, 0, 0) != 0;
+    if (enabled)
+    {
+        if (!vp->Dr2WatchApplied)
+        {
+            if ((*shadowDr7 & 0x30ULL) != 0)
+                return FALSE;
+            vp->Dr2WatchApplied = TRUE;
+        }
+        vp->GuestVmcb.StateSaveArea.Dr7 =
+            (vp->GuestVmcb.StateSaveArea.Dr7 & ~kDr2WatchDr7Mask) |
+            SvBuildDr2WatchDr7(shared);
+    }
+    else if (vp->Dr2WatchApplied)
+    {
+        vp->GuestVmcb.StateSaveArea.Dr7 =
+            (vp->GuestVmcb.StateSaveArea.Dr7 & ~kDr2WatchDr7Mask) |
+            (*shadowDr7 & kDr2WatchDr7Mask);
+        vp->Dr2WatchApplied = FALSE;
+    }
+    return TRUE;
+}
+
+typedef struct _GUEST_CONTEXT
+{
+    PGUEST_REGISTERS VpRegs;
+    BOOLEAN ExitVm;
+    BOOLEAN ResumeAtCurrentRip;
+} GUEST_CONTEXT, *PGUEST_CONTEXT;
+
+
+//
+// x86-64 defined constants.
+//
+#define IA32_MSR_PAT    0x00000277
+#define IA32_MSR_EFER   0xc0000080
+
+#define EFER_SVME       (1UL << 12)
+
+#define RPL_MASK        3
+#define DPL_SYSTEM      0
+
+#define CPUID_FN8000_0001_ECX_SVM                   (1UL << 2)
+#define CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT    (1UL << 31)
+#define CPUID_FN8000_000A_EDX_NP                    (1UL << 0)
+#define CPUID_FN8000_000A_EDX_DECODE_ASSISTS        (1UL << 7)
+
+#define CPUID_MAX_STANDARD_FN_NUMBER_AND_VENDOR_STRING          0x00000000
+#define CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS       0x00000001
+#define CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS_EX    0x80000001
+#define CPUID_SVM_FEATURES                                      0x8000000a
+//
+// The Microsoft Hypervisor interface defined constants.
+//
+#define CPUID_HV_VENDOR_AND_MAX_FUNCTIONS   0x40000000
+#define CPUID_HV_INTERFACE                  0x40000001
+
+//
+// SimpleSVM specific constants.
+//
+#define CPUID_UNLOAD_SIMPLE_SVM     0x41414141
+#define CPUID_HV_MAX                CPUID_HV_INTERFACE
+#define LMV_ENABLE_CPUID_TRACE      0
+#define LMV_NESTED_TEST_CPUID_LEAF  0x53564D54u
+
+/*!
+    @brief      Breaks into a kernel debugger when it is present.
+
+    @details    This macro is emits software breakpoint that only hits when a
+                kernel debugger is present. This macro is useful because it does
+                not change the current frame unlike the DbgBreakPoint function,
+                and breakpoint by this macro can be overwritten with NOP without
+                impacting other breakpoints.
+ */
+#define SV_DEBUG_BREAK() \
+    if (KD_DEBUGGER_NOT_PRESENT) \
+    { \
+        NOTHING; \
+    } \
+    else \
+    { \
+        __debugbreak(); \
+    } \
+    reinterpret_cast<void*>(0)
+
+//
+// A power state callback handle.
+//
+static PVOID g_PowerCallbackRegistration;
+static PDEVICE_OBJECT g_ControlDeviceObject;
+static UNICODE_STRING g_ControlSymbolicLink;
+
+/*!
+    @brief      Sends a message to the kernel debugger.
+
+    @param[in]  Format - The format string to print.
+ */
+#pragma prefast(push)
+#pragma prefast(disable : 26826, "C-style variable arguments needed for DbgPrint.")
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_same_
+static
+VOID
+SvDebugPrint (
+    _In_z_ _Printf_format_string_ PCSTR Format,
+    ...
+    )
+{
+    va_list argList;
+
+    va_start(argList, Format);
+    vDbgPrintExWithPrefix("[SimpleSvm] ",
+                          DPFLTR_IHVDRIVER_ID,
+                          DPFLTR_ERROR_LEVEL,
+                          Format,
+                          argList);
+    va_end(argList);
+}
+#pragma prefast(pop)
+
+static
+NTSTATUS
+LmvCompleteIrp (
+    _Inout_ PIRP Irp,
+    _In_ NTSTATUS Status,
+    _In_ ULONG_PTR Information
+    )
+{
+    Irp->IoStatus.Status = Status;
+    Irp->IoStatus.Information = Information;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Status;
+}
+
+static
+NTSTATUS
+LmvCreateClose (
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+    )
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    return LmvCompleteIrp(Irp, STATUS_SUCCESS, 0);
+}
+
+static
+NTSTATUS
+LmvDeviceControl (
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+    )
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+    if (stack->Parameters.DeviceIoControl.IoControlCode != IOCTL_LMV_QUERY_STATUS)
+    {
+        return LmvCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
+    }
+
+    if (stack->Parameters.DeviceIoControl.OutputBufferLength <
+        sizeof(LMV_QUERY_STATUS))
+    {
+        return LmvCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+    }
+
+    PLMV_QUERY_STATUS status =
+        static_cast<PLMV_QUERY_STATUS>(Irp->AssociatedIrp.SystemBuffer);
+    RtlZeroMemory(status, sizeof(*status));
+    status->Version = LMV_CONTROL_VERSION;
+    status->Size = sizeof(*status);
+    status->Flags = LMV_STATUS_FLAG_SVM_RUNNING;
+    return LmvCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*status));
+}
+
+static
+NTSTATUS
+LmvCreateControlDevice (
+    _In_ PDRIVER_OBJECT DriverObject
+    )
+{
+    UNICODE_STRING deviceName = RTL_CONSTANT_STRING(L"\\Device\\LMvtdriver");
+    g_ControlSymbolicLink = RTL_CONSTANT_STRING(L"\\DosDevices\\LMvtdriver");
+    NTSTATUS status = IoCreateDevice(DriverObject,
+                                     0,
+                                     &deviceName,
+                                     LMV_DEVICE_TYPE,
+                                     FILE_DEVICE_SECURE_OPEN,
+                                     FALSE,
+                                     &g_ControlDeviceObject);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    g_ControlDeviceObject->Flags |= DO_BUFFERED_IO;
+    status = IoCreateSymbolicLink(&g_ControlSymbolicLink, &deviceName);
+    if (!NT_SUCCESS(status))
+    {
+        IoDeleteDevice(g_ControlDeviceObject);
+        g_ControlDeviceObject = nullptr;
+        return status;
+    }
+    return STATUS_SUCCESS;
+}
+
+static
+VOID
+LmvDeleteControlDevice (
+    VOID
+    )
+{
+    if (g_ControlDeviceObject != nullptr)
+    {
+        IoDeleteSymbolicLink(&g_ControlSymbolicLink);
+        IoDeleteDevice(g_ControlDeviceObject);
+        g_ControlDeviceObject = nullptr;
+    }
+}
+
+/*!
+    @brief      Allocates page aligned, zero filled physical memory.
+
+    @details    This function allocates page aligned nonpaged pool. The
+                allocated memory is zero filled and must be freed with
+                SvFreePageAlingedPhysicalMemory. On Windows 8 and later versions
+                of Windows, the allocated memory is non executable.
+
+    @param[in]  NumberOfBytes - A size of memory to allocate in byte. This must
+                be equal or greater than PAGE_SIZE.
+
+    @result     A pointer to the allocated memory filled with zero; or NULL when
+                there is insufficient memory to allocate requested size.
+ */
+__drv_allocatesMem(Mem)
+_Post_writable_byte_size_(NumberOfBytes)
+_Post_maybenull_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_same_
+_Must_inspect_result_
+static
+PVOID
+SvAllocatePageAlingedPhysicalMemory (
+    _In_ SIZE_T NumberOfBytes
+    )
+{
+    PVOID memory;
+
+    //
+    // The size must be equal or greater than PAGE_SIZE in order to allocate
+    // page aligned memory.
+    //
+    NT_ASSERT(NumberOfBytes >= PAGE_SIZE);
+
+    memory = ExAllocatePool2(POOL_FLAG_NON_PAGED, NumberOfBytes, 'MVSS');
+    if (memory != nullptr)
+    {
+        NT_ASSERT(PAGE_ALIGN(memory) == memory);
+        RtlZeroMemory(memory, NumberOfBytes);
+    }
+    return memory;
+}
+
+/*!
+    @brief      Frees memory allocated by SvAllocatePageAlingedPhysicalMemory.
+
+    @param[in]  BaseAddress - The address returned by
+                SvAllocatePageAlingedPhysicalMemory.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_same_
+static
+VOID
+SvFreePageAlingedPhysicalMemory (
+    _Pre_notnull_ __drv_freesMem(Mem) PVOID BaseAddress
+    )
+{
+    ExFreePoolWithTag(BaseAddress, 'MVSS');
+}
+
+/*!
+    @brief      Allocates page aligned, zero filled contiguous physical memory.
+
+    @details    This function allocates page aligned nonpaged pool where backed
+                by contiguous physical pages. The allocated memory is zero
+                filled and must be freed with SvFreeContiguousMemory. The
+                allocated memory is executable.
+
+    @param[in]  NumberOfBytes - A size of memory to allocate in byte.
+
+    @result     A pointer to the allocated memory filled with zero; or NULL when
+                there is insufficient memory to allocate requested size.
+ */
+_Post_writable_byte_size_(NumberOfBytes)
+_Post_maybenull_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_same_
+_Must_inspect_result_
+static
+PVOID
+SvAllocateContiguousMemory (
+    _In_ SIZE_T NumberOfBytes
+    )
+{
+    PVOID memory;
+    PHYSICAL_ADDRESS boundary, lowest, highest;
+
+    boundary.QuadPart = lowest.QuadPart = 0;
+    highest.QuadPart = -1;
+
+    memory = MmAllocateContiguousNodeMemory(NumberOfBytes,
+                                            lowest,
+                                            highest,
+                                            boundary,
+                                            PAGE_READWRITE,
+                                            MM_ANY_NODE_OK);
+    if (memory != nullptr)
+    {
+        RtlZeroMemory(memory, NumberOfBytes);
+    }
+    return memory;
+}
+
+/*!
+    @brief      Frees memory allocated by SvAllocateContiguousMemory.
+
+    @param[in]  BaseAddress - The address returned by SvAllocateContiguousMemory.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_same_
+static
+VOID
+SvFreeContiguousMemory (
+    _In_ PVOID BaseAddress
+    )
+{
+    MmFreeContiguousMemory(BaseAddress);
+}
+
+/*!
+    @brief          Injects #GP with 0 of error code.
+
+    @param[in,out]  VpData - Per processor data.
+ */
+_IRQL_requires_same_
+static
+VOID
+SvInjectGeneralProtectionException (
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    EVENTINJ event;
+
+    //
+    // Inject #GP(vector = 13, type = 3 = exception) with a valid error code.
+    // An error code are always zero. See "#GP-General-Protection Exception
+    // (Vector 13)" for details about the error code.
+    //
+    event.AsUInt64 = 0;
+    event.Fields.Vector = 13;
+    event.Fields.Type = 3;
+    event.Fields.ErrorCodeValid = 1;
+    event.Fields.Valid = 1;
+    VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+}
+
+static VOID SvRecordNestedTrace(
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _In_ NESTED_SVM_TRACE_ACTION Action,
+    _In_ NESTED_SVM_FAILURE Failure = NestedFailureNone
+    )
+{
+    UINT64 sequence = ++VpData->NestedTraceSequence;
+    NESTED_SVM_TRACE_RECORD* record =
+        &VpData->NestedTrace[(sequence - 1) % RTL_NUMBER_OF(VpData->NestedTrace)];
+    record->Sequence = 0;
+    record->Action = Action;
+    record->Failure = Failure;
+    record->VmcbGpa = VpData->NestedL1VmcbGpa;
+    record->HsaveGpa = VpData->NestedVirtualVmHsavePa;
+    record->VirtualEfer = VpData->NestedActive ?
+        VpData->NestedL2VirtualEfer : VpData->NestedVirtualEfer;
+    record->ExecutionEfer = VpData->GuestVmcb.StateSaveArea.Efer;
+    record->ExitCode = VpData->GuestVmcb.ControlArea.ExitCode;
+    record->ExitInfo1 = VpData->GuestVmcb.ControlArea.ExitInfo1;
+    record->ExitInfo2 = VpData->GuestVmcb.ControlArea.ExitInfo2;
+    record->Rip = VpData->GuestVmcb.StateSaveArea.Rip;
+    record->NRip = VpData->GuestVmcb.ControlArea.NRip;
+    record->GuestRax = VpData->GuestVmcb.StateSaveArea.Rax;
+    record->L2Active = VpData->NestedActive;
+    record->VirtualGif = VpData->NestedActive ?
+        VpData->NestedL2VirtualGif : VpData->NestedVirtualGif;
+    KeMemoryBarrier();
+    record->Sequence = sequence;
+    InterlockedExchangePointer(&g_SvmNestedLastVp, VpData);
+}
+
+static VOID SvReleaseNestedMemoryWindow(_Inout_ PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    InterlockedCompareExchangePointer(&g_SvmNestedLastVp, nullptr, VpData);
+    if (VpData->NestedRamRanges != nullptr)
+    {
+        ExFreePool(VpData->NestedRamRanges);
+        VpData->NestedRamRanges = nullptr;
+    }
+}
+
+static NTSTATUS SvInitializeNestedMemoryWindow(_Inout_ PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    VpData->NestedRamRanges = MmGetPhysicalMemoryRanges();
+    return VpData->NestedRamRanges != nullptr ? STATUS_SUCCESS :
+        STATUS_INSUFFICIENT_RESOURCES;
+}
+
+static BOOLEAN SvIsNestedRamPage(_In_ const VIRTUAL_PROCESSOR_DATA* VpData,
+                                _In_ UINT64 HostPhysicalAddress)
+{
+    UINT64 pagePa = HostPhysicalAddress & ~(static_cast<UINT64>(PAGE_SIZE) - 1);
+    for (PPHYSICAL_MEMORY_RANGE range = VpData->NestedRamRanges;
+         range != nullptr && range->NumberOfBytes.QuadPart != 0; ++range)
+    {
+        UINT64 start = range->BaseAddress.QuadPart;
+        UINT64 length = range->NumberOfBytes.QuadPart;
+        if (pagePa >= start && length >= PAGE_SIZE && pagePa - start <= length - PAGE_SIZE)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOLEAN SvCopyNestedGuestPhysical(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _In_ UINT64 GuestPhysicalAddress,
+    _Inout_updates_bytes_(Length) PVOID Buffer,
+    _In_ SIZE_T Length,
+    _In_ BOOLEAN Write
+    )
+{
+    PUCHAR buffer = static_cast<PUCHAR>(Buffer);
+    if (Length == 0 || GuestPhysicalAddress > MAXUINT64 - (Length - 1))
+        return FALSE;
+
+    while (Length != 0)
+    {
+        UINT64 hostPhysicalAddress;
+        if (!SvTranslateNpt2Mb(VpData->HostStackLayout.SharedVpData,
+                               GuestPhysicalAddress, &hostPhysicalAddress) ||
+            !SvIsNestedRamPage(VpData, hostPhysicalAddress))
+            return FALSE;
+        SIZE_T pageOffset = static_cast<SIZE_T>(hostPhysicalAddress & (PAGE_SIZE - 1));
+        SIZE_T chunk = PAGE_SIZE - pageOffset;
+        if (chunk > Length)
+            chunk = Length;
+        PHYSICAL_ADDRESS physicalAddress;
+        physicalAddress.QuadPart = hostPhysicalAddress & ~(static_cast<UINT64>(PAGE_SIZE) - 1);
+        PVOID mappedPage = MmMapIoSpace(physicalAddress, PAGE_SIZE, MmCached);
+        if (mappedPage == nullptr)
+            return FALSE;
+        PUCHAR mappedBytes = static_cast<PUCHAR>(mappedPage) + pageOffset;
+        if (Write)
+            RtlCopyMemory(mappedBytes, buffer, chunk);
+        else
+            RtlCopyMemory(buffer, mappedBytes, chunk);
+        MmUnmapIoSpace(mappedPage, PAGE_SIZE);
+        GuestPhysicalAddress += chunk;
+        buffer += chunk;
+        Length -= chunk;
+    }
+    return TRUE;
+}
+
+static BOOLEAN SvIsNestedPhysicalRangeMapped(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _In_ UINT64 GuestPhysicalAddress,
+    _In_ SIZE_T Length
+    );
+
+static BOOLEAN SvReadNestedVmcb(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _In_ UINT64 GuestPhysicalAddress,
+    _Out_ PVMCB Vmcb
+    )
+{
+    if ((GuestPhysicalAddress & (PAGE_SIZE - 1)) != 0 ||
+        !SvIsNestedPhysicalRangeMapped(VpData,
+                                       GuestPhysicalAddress,
+                                       sizeof(*Vmcb)))
+    {
+        return FALSE;
+    }
+
+    return SvCopyNestedGuestPhysical(VpData,
+                                     GuestPhysicalAddress,
+                                     Vmcb,
+                                     sizeof(*Vmcb),
+                                     FALSE);
+}
+
+static BOOLEAN SvWriteNestedVmcb(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _In_ UINT64 GuestPhysicalAddress,
+    _In_ const VMCB* Vmcb
+    )
+{
+    if ((GuestPhysicalAddress & (PAGE_SIZE - 1)) != 0 ||
+        !SvIsNestedPhysicalRangeMapped(VpData,
+                                       GuestPhysicalAddress,
+                                       sizeof(*Vmcb)))
+    {
+        return FALSE;
+    }
+
+    return SvCopyNestedGuestPhysical(VpData,
+                                     GuestPhysicalAddress,
+                                     const_cast<PVMCB>(Vmcb),
+                                     sizeof(*Vmcb),
+                                      TRUE);
+}
+
+static constexpr UINT64 kNestedPhysicalAddressMask = (1ULL << 40) - 1;
+static constexpr UINT64 kNestedVmcbMisc2ValidMask = 0x3fffULL;
+static constexpr UINT64 kNestedEferValidMask = 0xfd01ULL;
+static constexpr UINT64 kNestedCr0ValidMask = 0xe005003fULL;
+
+static BOOLEAN SvIsNestedCanonicalAddress(_In_ UINT64 Address)
+{
+    int registers[4];
+    UINT32 virtualBits;
+    UINT64 lowMask;
+    UINT64 signBit;
+    UINT64 highMask;
+
+    __cpuid(registers, 0x80000008);
+    virtualBits = static_cast<UINT32>((registers[2] >> 8) & 0xff);
+    if (virtualBits < 48 || virtualBits > 57)
+    {
+        virtualBits = 48;
+    }
+
+    lowMask = (1ULL << virtualBits) - 1;
+    signBit = 1ULL << (virtualBits - 1);
+    highMask = ~lowMask;
+    return (Address & signBit) == 0 ?
+        (Address & highMask) == 0 : (Address & highMask) == highMask;
+}
+
+static BOOLEAN SvIsNestedPhysicalRangeMapped(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _In_ UINT64 GuestPhysicalAddress,
+    _In_ SIZE_T Length
+    )
+{
+    UINT64 lastAddress;
+    UINT64 page;
+
+    if (Length == 0 ||
+        GuestPhysicalAddress > MAXUINT64 - (Length - 1) ||
+        GuestPhysicalAddress > kNestedPhysicalAddressMask ||
+        GuestPhysicalAddress + (Length - 1) > kNestedPhysicalAddressMask)
+    {
+        return FALSE;
+    }
+
+    lastAddress = (GuestPhysicalAddress + (Length - 1)) & ~(PAGE_SIZE - 1);
+    page = GuestPhysicalAddress & ~(PAGE_SIZE - 1);
+    for (;;)
+    {
+        UINT64 hostPhysicalAddress;
+
+        if (!SvTranslateNpt2Mb(VpData->HostStackLayout.SharedVpData, page, &hostPhysicalAddress) ||
+            !SvIsNestedRamPage(VpData, hostPhysicalAddress))
+        {
+            return FALSE;
+        }
+        if (page == lastAddress)
+        {
+            break;
+        }
+        page += PAGE_SIZE;
+    }
+    return TRUE;
+}
+
+static BOOLEAN SvIsNestedEventInjectionValid(_In_ UINT64 EventValue)
+{
+    EVENTINJ event;
+
+    event.AsUInt64 = EventValue;
+    if (event.Fields.Valid == 0)
+    {
+        return TRUE;
+    }
+
+    if (event.Fields.Reserved1 != 0 || event.Fields.Type == 1 ||
+        event.Fields.Type > 4 ||
+        (event.Fields.ErrorCodeValid != 0 && event.Fields.Type != 3))
+    {
+        return FALSE;
+    }
+
+    if (event.Fields.Type == 2)
+    {
+        return event.Fields.Vector == 2;
+    }
+    if (event.Fields.Type == 3)
+    {
+        return event.Fields.Vector <= 31;
+    }
+    return TRUE;
+}
+
+static BOOLEAN SvIsNestedVmcbValid(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _In_ const VMCB* Vmcb
+    )
+{
+    int registers[4];
+    UINT32 maximumAsid;
+    const VMCB_CONTROL_AREA* control = &Vmcb->ControlArea;
+    const VMCB_STATE_SAVE_AREA* save = &Vmcb->StateSaveArea;
+
+    __cpuid(registers, 0x8000000a);
+    maximumAsid = static_cast<UINT32>(registers[1]);
+    if (control->GuestAsid == 0 ||
+        (maximumAsid != 0 && control->GuestAsid > maximumAsid) ||
+        (control->InterceptMisc2 & ~kNestedVmcbMisc2ValidMask) != 0 ||
+        (control->NpEnable & ~SVM_NP_ENABLE_NP_ENABLE) != 0 ||
+        (control->NpEnable & SVM_NP_ENABLE_NP_ENABLE) != 0 ||
+        (control->TlbControl != 0 && control->TlbControl != 1 &&
+         control->TlbControl != 3 && control->TlbControl != 7) ||
+        (save->Efer & ~kNestedEferValidMask) != 0 ||
+        (save->Cr0 & ~kNestedCr0ValidMask) != 0 ||
+        (save->Rflags & 2) == 0 ||
+        !SvIsNestedCanonicalAddress(save->Rip) ||
+        !SvIsNestedCanonicalAddress(save->Rsp) ||
+        save->Cpl > 3 ||
+        !SvIsNestedEventInjectionValid(control->EventInj))
+    {
+        return FALSE;
+    }
+
+    if ((control->InterceptMisc1 & SVM_INTERCEPT_MISC1_MSR_PROT) != 0 &&
+        (control->MsrpmBasePa == 0 ||
+         (control->MsrpmBasePa & (PAGE_SIZE - 1)) != 0 ||
+         !SvIsNestedPhysicalRangeMapped(VpData,
+                                        control->MsrpmBasePa,
+                                        SVM_MSR_PERMISSIONS_MAP_SIZE)))
+    {
+        return FALSE;
+    }
+
+    if ((control->InterceptMisc1 & SVM_INTERCEPT_MISC1_IOIO) != 0 &&
+        (control->IopmBasePa == 0 ||
+         (control->IopmBasePa & (PAGE_SIZE - 1)) != 0 ||
+         !SvIsNestedPhysicalRangeMapped(VpData,
+                                        control->IopmBasePa,
+                                        SVM_IO_PERMISSIONS_MAP_SIZE)))
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN SvGetMsrPermission(
+    _In_ const UCHAR* MsrPermissionsMap,
+    _In_ UINT32 Msr,
+    _In_ BOOLEAN Write
+    )
+{
+    UINT32 bitOffset;
+
+    if (Msr <= 0x1fff)
+    {
+        bitOffset = Msr * 2;
+    }
+    else if (Msr >= 0xc0000000 && Msr <= 0xc0001fff)
+    {
+        bitOffset = 0x800 * CHAR_BIT + (Msr - 0xc0000000) * 2;
+    }
+    else if (Msr >= 0xc0010000 && Msr <= 0xc0011fff)
+    {
+        bitOffset = 0x1000 * CHAR_BIT + (Msr - 0xc0010000) * 2;
+    }
+    else
+    {
+        return FALSE;
+    }
+
+    if (Write)
+    {
+        ++bitOffset;
+    }
+
+    return (MsrPermissionsMap[bitOffset / CHAR_BIT] &
+            (1u << (bitOffset % CHAR_BIT))) != 0;
+}
+
+static VOID SvSetMsrPermissions(
+    _Inout_ UCHAR* MsrPermissionsMap,
+    _In_ UINT32 Msr,
+    _In_ BOOLEAN Read,
+    _In_ BOOLEAN Write
+    )
+{
+    UINT32 bitOffset;
+
+    if (Msr <= 0x1fff)
+    {
+        bitOffset = Msr * 2;
+    }
+    else if (Msr >= 0xc0000000 && Msr <= 0xc0001fff)
+    {
+        bitOffset = 0x800 * CHAR_BIT + (Msr - 0xc0000000) * 2;
+    }
+    else if (Msr >= 0xc0010000 && Msr <= 0xc0011fff)
+    {
+        bitOffset = 0x1000 * CHAR_BIT + (Msr - 0xc0010000) * 2;
+    }
+    else
+    {
+        return;
+    }
+
+    if (Read)
+    {
+        MsrPermissionsMap[bitOffset / CHAR_BIT] |=
+            static_cast<UCHAR>(1u << (bitOffset % CHAR_BIT));
+    }
+    if (Write)
+    {
+        ++bitOffset;
+        MsrPermissionsMap[bitOffset / CHAR_BIT] |=
+            static_cast<UCHAR>(1u << (bitOffset % CHAR_BIT));
+    }
+}
+
+static
+BOOLEAN
+SvHandleNptTestWriteFault (
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+        VpData->HostStackLayout.SharedVpData;
+    UINT64 faultGpa = VpData->GuestVmcb.ControlArea.ExitInfo2;
+    UINT64 faultInfo = VpData->GuestVmcb.ControlArea.ExitInfo1;
+    UINT64 registeredGpa = faultGpa & ~(static_cast<UINT64>(PAGE_SIZE) - 1);
+    PNPT_TEST_PAGE page = SvFindNptTestPage(sharedVpData, registeredGpa);
+
+    if (page == nullptr ||
+        (faultInfo & 3) != 3 ||
+        (faultInfo & ((1ull << 3) | (1ull << 4))) != 0 ||
+        InterlockedCompareExchange(&page->State,
+                                   NPT_TEST_STATE_MAPPED,
+                                   NPT_TEST_STATE_MAPPED) != NPT_TEST_STATE_MAPPED)
+    {
+        return FALSE;
+    }
+
+    LONG watchState = InterlockedCompareExchange(
+        &page->WatchState,
+        NPT_TEST_WATCH_BUSY,
+        NPT_TEST_WATCH_ARMED);
+    if (watchState == NPT_TEST_WATCH_ARMED)
+    {
+        volatile LONG64* pte = SvGetNptTestPte(sharedVpData, registeredGpa);
+        UINT64 pteValue = pte == nullptr ? 0 : static_cast<UINT64>(
+            InterlockedCompareExchange64(pte, 0, 0));
+        if ((pteValue & 3) != 1 ||
+            (pteValue & 0x000ffffffffff000ull) !=
+                page->BackingPhysicalAddress)
+        {
+            InterlockedExchange(&page->WatchState, NPT_TEST_WATCH_ARMED);
+            return FALSE;
+        }
+
+        InterlockedExchange64(pte, static_cast<LONG64>(pteValue | 2ull));
+        KeMemoryBarrier();
+        InterlockedExchange64(&page->WriteFaultInfo1,
+                              static_cast<LONG64>(faultInfo));
+        InterlockedExchange64(&page->WriteFaultGpa,
+                              static_cast<LONG64>(faultGpa));
+        InterlockedIncrement64(&page->WriteNpfCount);
+        InterlockedExchange(&page->WatchState, NPT_TEST_WATCH_FIRED);
+        SvDebugPrint("NPT write NPF: CPU=%hu:%hu GPA=%llx Info1=%llx RIP=%llx\n",
+                     VpData->ProcessorGroup,
+                     VpData->ProcessorNumber,
+                     faultGpa,
+                     faultInfo,
+                     VpData->GuestVmcb.StateSaveArea.Rip);
+    }
+    else if (watchState == NPT_TEST_WATCH_BUSY)
+    {
+        for (ULONG attempts = 0; attempts < 100000; ++attempts)
+        {
+            _mm_pause();
+            watchState = InterlockedCompareExchange(
+                &page->WatchState, NPT_TEST_WATCH_FIRED,
+                NPT_TEST_WATCH_FIRED);
+            if (watchState != NPT_TEST_WATCH_BUSY)
+            {
+                break;
+            }
+        }
+        if (watchState == NPT_TEST_WATCH_BUSY)
+        {
+            return FALSE;
+        }
+    }
+    else if (watchState != NPT_TEST_WATCH_FIRED)
+    {
+        return FALSE;
+    }
+
+    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+    return TRUE;
+}
+
+/*!
+    @brief          Read or write Guest virtual memory via CR3 switch.
+
+    @details        This function temporarily switches the Host's CR3 to the Guest's
+                    process CR3, allowing direct access to Guest virtual addresses.
+                    This is the core of the transparent memory access mechanism.
+
+    @param[in]      VirtualAddress - Guest virtual address to access.
+    @param[in]      Cr3 - Guest process CR3 value.
+    @param[in,out]  Buffer - Data buffer (read destination or write source).
+    @param[in]      Length - Number of bytes to transfer.
+    @param[in]      IsWrite - TRUE for write, FALSE for read.
+
+    @return         TRUE if successful, FALSE otherwise.
+ */
+_IRQL_requires_same_
+static
+BOOLEAN
+SvReadWriteVirtualMemory(
+    _In_ UINT64 VirtualAddress,
+    _In_ UINT64 Cr3,
+    _Inout_ PUCHAR Buffer,
+    _In_ ULONG Length,
+    _In_ BOOLEAN IsWrite
+    )
+{
+    UINT64 originalCr3;
+    BOOLEAN success = FALSE;
+
+    if (VirtualAddress == 0 || Cr3 == 0 || Buffer == nullptr || Length == 0)
+    {
+        return FALSE;
+    }
+
+    // Save current CR3
+    originalCr3 = __readcr3();
+
+    __try
+    {
+        // Switch to Guest process CR3
+        __writecr3(Cr3);
+
+        // Access Guest virtual memory directly
+        if (IsWrite)
+        {
+            RtlCopyMemory(reinterpret_cast<PVOID>(VirtualAddress), Buffer, Length);
+        }
+        else
+        {
+            RtlCopyMemory(Buffer, reinterpret_cast<PVOID>(VirtualAddress), Length);
+        }
+
+        success = TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        // Page fault or access violation
+        success = FALSE;
+    }
+
+    // Restore original CR3
+    __writecr3(originalCr3);
+
+    return success;
+}
+
+/*!
+    @brief          Handles #VMEXIT due to execution of the CPUID instructions.
+
+    @details        This function returns unmodified results of the CPUID
+                    instruction, except for few cases to indicate presence of
+                    the hypervisor, and to process an unload request.
+
+                    CPUID leaf 0x40000000 and 0x40000001 return modified values
+                    to conform to the hypervisor interface to some extent. See
+                    "Requirements for implementing the Microsoft Hypervisor interface"
+                    https://msdn.microsoft.com/en-us/library/windows/hardware/Dn613994(v=vs.85).aspx
+                    for details of the interface.
+
+    @param[in,out]  VpData - Per processor data.
+    @param[in,out]  GuestContext - Guest's GPRs.
+ */
+_IRQL_requires_same_
+static
+VOID
+SvHandleCpuid (
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _Inout_ PGUEST_CONTEXT GuestContext
+    )
+{
+    int registers[4];   // EAX, EBX, ECX, and EDX
+    int leaf, subLeaf;
+    SEGMENT_ATTRIBUTE attribute;
+
+    //
+    // Execute CPUID as requested.
+    //
+    leaf = static_cast<int>(GuestContext->VpRegs->Rax);
+    subLeaf = static_cast<int>(GuestContext->VpRegs->Rcx);
+
+    if (static_cast<UINT32>(leaf) == LMV_CPUID_CALL_LEAF &&
+        GuestContext->VpRegs->R15 == LMV_CPUID_CALL_MAGIC)
+    {
+        UINT32 commandId;
+        UINT32 sequence;
+        UINT32 status;
+        UINT32 flags;
+        BOOLEAN directResult;
+
+        commandId = static_cast<UINT32>(GuestContext->VpRegs->R14);
+        sequence = static_cast<UINT32>(GuestContext->VpRegs->R13);
+        status = LMV_CPUID_RESULT_UNSUPPORTED;
+        flags = 0;
+        directResult = FALSE;
+
+        attribute.AsUInt16 = VpData->GuestVmcb.StateSaveArea.SsAttrib;
+        if (attribute.Fields.Dpl != DPL_SYSTEM)
+        {
+            status = LMV_CPUID_RESULT_INVALID_ARGUMENT;
+        }
+        else
+        {
+            attribute.AsUInt16 = VpData->GuestVmcb.StateSaveArea.SsAttrib;
+            if (attribute.Fields.Dpl != DPL_SYSTEM)
+            {
+                status = LMV_CPUID_RESULT_INVALID_ARGUMENT;
+            }
+            else
+            {
+                switch (commandId)
+                {
+                case LmvCpuidCommandQueryStatus:
+                    flags = LMV_STATUS_FLAG_SVM_RUNNING;
+                    status = LMV_CPUID_RESULT_SUCCESS;
+                    break;
+
+                case LmvCpuidCommandNotifySharedCommand:
+                    if (VpData->HostStackLayout.SharedVpData->SharedPage.Magic != LMV_SHARED_PAGE_MAGIC ||
+                        VpData->HostStackLayout.SharedVpData->SharedPage.Version != LMV_CPUID_PROTOCOL_VERSION ||
+                        VpData->HostStackLayout.SharedVpData->SharedPage.Size != sizeof(LMV_SHARED_PAGE) ||
+                        InterlockedCompareExchange(
+                            reinterpret_cast<volatile LONG*>(&VpData->HostStackLayout.SharedVpData->SharedPage.State),
+                            LMV_SHARED_STATE_PROCESSING,
+                            LMV_SHARED_STATE_READY) != LMV_SHARED_STATE_READY)
+                    {
+                        status = LMV_CPUID_RESULT_INVALID_ARGUMENT;
+                    }
+                    else
+                    {
+                        PLMV_SHARED_PAGE page = &VpData->HostStackLayout.SharedVpData->SharedPage;
+                        RtlZeroMemory(&page->Result, sizeof(page->Result));
+                        page->Result.Version = LMV_CPUID_PROTOCOL_VERSION;
+                        page->Result.Size = sizeof(LMV_SHARED_RESULT);
+                        page->Result.Sequence = page->Command.Sequence;
+                        if (page->Command.Version != LMV_CPUID_PROTOCOL_VERSION ||
+                            page->Command.Size != sizeof(LMV_SHARED_COMMAND) ||
+                            page->Command.Sequence != sequence)
+                        {
+                            page->Result.Status = LMV_CPUID_RESULT_INVALID_ARGUMENT;
+                        }
+                        else if (VpData->HostStackLayout.SharedVpData->KiGuestRetired &&
+                            page->Command.CommandId != LmvDebugCommandQueryKiDrain &&
+                            page->Command.CommandId != LmvDebugCommandRetireKiGuest &&
+                            page->Command.CommandId != LmvCpuidCommandQueryStatus)
+                        {
+                            page->Result.Status = static_cast<ULONG>(STATUS_DELETE_PENDING);
+                        }
+                         else if (VpData->HostStackLayout.SharedVpData->KiGuestRegistered &&
+                            page->Command.CommandId != LmvDebugCommandStartKiSession &&
+                            page->Command.CommandId != LmvDebugCommandSetMode &&
+                            page->Command.CommandId != LmvDebugCommandStopKiSession &&
+                            page->Command.CommandId != LmvDebugCommandConfigureDr2Watch &&
+                            page->Command.CommandId != LmvDebugCommandRemoveDr2Watch &&
+                            page->Command.CommandId != LmvDebugCommandQueryKiDrain &&
+                            page->Command.CommandId != LmvDebugCommandRetireKiGuest &&
+                            page->Command.CommandId != LmvDebugCommandTranslateNpt &&
+                            page->Command.CommandId != LmvCpuidCommandQueryStatus)
+                        {
+                            page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                        }
+                        else if (page->Command.CommandId == LmvCpuidCommandQueryStatus)
+                        {
+                            page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                            page->Result.Flags = LMV_STATUS_FLAG_SVM_RUNNING;
+                        }
+                         else if (page->Command.CommandId == LmvDebugCommandArmPrivateDr3)
+                         {
+                             UINT64 target = page->Command.Argument0;
+                             if (target == 0 || (target >> 48) != 0xffff ||
+                                 VpData->PrivateDr3Target != 0)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_INVALID_PARAMETER);
+                             else
+                             {
+                                 VpData->PrivateDr3OneShot = FALSE;
+                                 VpData->PrivateDr3RedirectRip = 0;
+                                 VpData->PrivateDr3Target = target;
+                                 VpData->GuestVmcb.StateSaveArea.Dr6 &= ~8ULL;
+                                 VpData->GuestVmcb.StateSaveArea.Dr7 =
+                                     (VpData->GuestShadowDr7 & ~0xF00000C0ULL) | 0x40;
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 page->Result.Value0 = static_cast<UINT64>(
+                                     InterlockedCompareExchange64(&VpData->PrivateDr3Hits, 0, 0));
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandDisarmPrivateDr3)
+                         {
+                             VpData->GuestVmcb.StateSaveArea.Dr7 =
+                                 VpData->GuestShadowDr7 & ~0xF00000C0ULL;
+                             VpData->PrivateDr3Target = 0;
+                             VpData->PrivateDr3OneShot = FALSE;
+                             VpData->PrivateDr3RedirectRip = 0;
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             page->Result.Value0 = static_cast<UINT64>(
+                                 InterlockedCompareExchange64(&VpData->PrivateDr3Hits, 0, 0));
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandQueryPrivateDr3)
+                         {
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             page->Result.Value0 = static_cast<UINT64>(
+                                 InterlockedCompareExchange64(&VpData->PrivateDr3Hits, 0, 0));
+                             page->Result.Value1 = VpData->PrivateDr3Target;
+                             page->Result.Value2 = VpData->GuestShadowDr3;
+                             page->Result.Value3 = VpData->GuestShadowDr7;
+                         }
+                          else if (page->Command.CommandId == LmvDebugCommandArmKiDr3Once ||
+                                   page->Command.CommandId == LmvDebugCommandArmKiDr3RedirectOnce)
+                          {
+                              UINT64 target = page->Command.Argument0;
+                              UINT64 redirect = page->Command.CommandId == LmvDebugCommandArmKiDr3RedirectOnce ?
+                                  page->Command.Argument1 : 0;
+                              if (target == 0 || (target >> 48) != 0xffff ||
+                                  (page->Command.CommandId == LmvDebugCommandArmKiDr3RedirectOnce &&
+                                   (redirect == 0 || (redirect >> 48) != 0xffff)) ||
+                                  VpData->PrivateDr3Target != 0)
+                                  page->Result.Status = static_cast<ULONG>(STATUS_INVALID_PARAMETER);
+                              else
+                              {
+                                  VpData->PrivateDr3LastRip = 0;
+                                  VpData->PrivateDr3LastDr6 = 0;
+                                  VpData->PrivateDr3LastCr3 = 0;
+                                  VpData->PrivateDr3LastRcx = 0;
+                                  VpData->PrivateDr3LastRdx = 0;
+                                  VpData->PrivateDr3LastR8 = 0;
+                                  VpData->PrivateDr3LastR9 = 0;
+                                  VpData->PrivateDr3LastRsp = 0;
+                                  VpData->PrivateDr3LastRflags = 0;
+                                  VpData->PrivateDr3LastRax = 0;
+                                  VpData->PrivateDr3LastRbp = 0;
+                                  VpData->GuestVmcb.StateSaveArea.Dr6 &= ~8ULL;
+                                  VpData->GuestVmcb.StateSaveArea.Dr7 =
+                                      (VpData->GuestShadowDr7 & ~0xF00000C0ULL) | 0x40;
+                                  VpData->PrivateDr3RedirectRip = redirect;
+                                  VpData->PrivateDr3Target = target;
+                                  VpData->PrivateDr3OneShot = TRUE;
+                                  page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                  page->Result.Value0 = static_cast<UINT64>(
+                                      InterlockedCompareExchange64(&VpData->PrivateDr3Hits, 0, 0));
+                              }
+                          }
+                          else if (page->Command.CommandId == LmvDebugCommandQueryKiDr3Once)
+                          {
+                              page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                              page->Result.Value0 = static_cast<UINT64>(
+                                  InterlockedCompareExchange64(&VpData->PrivateDr3Hits, 0, 0));
+                              page->Result.Value1 = VpData->PrivateDr3LastRip;
+                              page->Result.Value2 = VpData->PrivateDr3LastDr6;
+                              page->Result.Value3 = VpData->PrivateDr3LastCr3;
+                              page->Result.Flags = static_cast<ULONG>(
+                                  VpData->GuestVmcb.StateSaveArea.Dr7);
+                          }
+                          else if (page->Command.CommandId == LmvDebugCommandQueryKiDr3Args)
+                          {
+                              page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                              page->Result.Value0 = VpData->PrivateDr3LastRcx;
+                              page->Result.Value1 = VpData->PrivateDr3LastRdx;
+                              page->Result.Value2 = VpData->PrivateDr3LastR8;
+                              page->Result.Value3 = VpData->PrivateDr3LastR9;
+                              page->Result.Flags =
+                                  (static_cast<ULONG>(VpData->ProcessorGroup) << 16) |
+                                  VpData->ProcessorNumber;
+                          }
+                          else if (page->Command.CommandId == LmvDebugCommandQueryKiDr3Frame)
+                          {
+                              page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                              page->Result.Value0 = VpData->PrivateDr3LastRsp;
+                              page->Result.Value1 = VpData->PrivateDr3LastRflags;
+                              page->Result.Value2 = VpData->PrivateDr3LastRax;
+                              page->Result.Value3 = VpData->PrivateDr3LastRbp;
+                          }
+
+                         else if (page->Command.CommandId == LmvDebugCommandRegisterKiExits)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             UINT64 base = page->Command.Argument0;
+                             UINT64 end = page->Command.Argument1;
+                             UINT64 capture = page->Command.Argument2;
+                             UINT64 commit = page->Command.Argument3;
+                             if (shared->KiGuestRetired || shared->KiGuestRegistered ||
+                                 shared->KiSessionEnabled || shared->KiArmedProcessors || shared->KiInFlight ||
+                                 shared->DebugHook.State != 0 || g_DebugAttached ||
+                                 (base >> 48) != 0xffff || end <= base || (end >> 48) != 0xffff ||
+                                 capture < base || capture >= end || commit < base || commit >= end || capture == commit)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_INVALID_DEVICE_STATE);
+                             else
+                             {
+                                 shared->KiGuestBase = base;
+                                 shared->KiGuestEnd = end;
+                                 shared->KiCaptureExit = capture;
+                                 shared->KiCommitExit = commit;
+                                 InterlockedExchange(&shared->KiGuestRegistered, 1);
+                                 g_HostDriverObject->DriverUnload = nullptr;
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandQueryKiDrain)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             page->Result.Value0 = InterlockedCompareExchange64(&shared->KiInFlight, 0, 0);
+                             page->Result.Value1 = InterlockedCompareExchange(&shared->KiArmedProcessors, 0, 0);
+                             page->Result.Value2 = (shared->KiGuestRegistered ? LMV_KI_DRAIN_REGISTERED : 0) |
+                                 (shared->KiSessionEnabled ? LMV_KI_DRAIN_ENABLED : 0) |
+                                 (shared->KiGuestRetired ? LMV_KI_DRAIN_RETIRED : 0);
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandRetireKiGuest)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             if (!LmvKiDrainComplete(
+                                 InterlockedCompareExchange64(&shared->KiInFlight, 0, 0),
+                                 InterlockedCompareExchange(&shared->KiArmedProcessors, 0, 0),
+                                 shared->KiSessionEnabled ? LMV_KI_DRAIN_ENABLED : 0) ||
+                                 shared->DebugHook.ExecuteProbe || shared->DebugHook.State != 0 || g_DebugAttached)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                             else
+                             {
+                                 InterlockedExchange(&shared->KiGuestRetired, 1);
+                                 InterlockedExchange(&shared->KiGuestRegistered, 0);
+                                 shared->KiSessionEventStub = 0;
+                                 shared->KiSessionPassStub = 0;
+                                 shared->KiSessionEntry = 0;
+                                 shared->KiCaptureExit = 0;
+                                 shared->KiCommitExit = 0;
+                                 shared->KiPassExit = 0;
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandStartKiSession)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             int capabilities[4];
+                             __cpuid(capabilities, 0x80000008);
+                             ULONG physicalBits = capabilities[0] & 0xff;
+                             if (!shared->KiGuestRegistered || shared->KiGuestRetired ||
+                                 InterlockedCompareExchange64(&shared->KiInFlight, 0, 0) != 0 ||
+                                 InterlockedCompareExchange(&shared->KiArmedProcessors, 0, 0) != 0 ||
+                                 physicalBits < 32 || physicalBits > 52 ||
+                                 page->Command.Argument0 == 0 ||
+                                 (page->Command.Argument1 >> 48) != 0xffff ||
+                                 (page->Command.Argument2 >> 48) != 0xffff ||
+                                 (page->Command.Argument3 >> 48) != 0xffff ||
+                                 page->Command.Argument2 < shared->KiGuestBase ||
+                                 page->Command.Argument2 >= shared->KiGuestEnd ||
+                                 page->Command.Argument3 < shared->KiGuestBase ||
+                                 page->Command.Argument3 + 4 >= shared->KiGuestEnd ||
+                                 InterlockedCompareExchange(&shared->KiSessionEnabled, 0, 0) != 0 ||
+                                 InterlockedCompareExchange(&g_DebugAttached, 0, 0) != 0)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                             else
+                             {
+                                 shared->KiSessionCr3Mask = ((1ull << physicalBits) - 1) & ~0xfffull;
+                                 shared->KiSessionCr3 = page->Command.Argument0 & shared->KiSessionCr3Mask;
+                                 shared->KiSessionEntry = page->Command.Argument1;
+                                 shared->KiSessionEventStub = page->Command.Argument2;
+                                 shared->KiSessionPassStub = page->Command.Argument3;
+                                 shared->KiPassExit = page->Command.Argument3 + 1;
+                                 KeMemoryBarrier();
+                                 InterlockedExchange(&shared->KiSessionEnabled, 1);
+                                 g_HostDriverObject->DriverUnload = nullptr;
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandStopKiSession)
+                         {
+                             InterlockedExchange(&VpData->HostStackLayout.SharedVpData->Dr2WatchEnabled, 0);
+                             VpData->HostStackLayout.SharedVpData->Dr2WatchUserCr3 = 0;
+                             InterlockedExchange(&VpData->HostStackLayout.SharedVpData->KiSessionEnabled, 0);
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandConfigureDr2Watch)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             UINT64 address = page->Command.Argument0;
+                             ULONG length = static_cast<ULONG>(page->Command.Argument1);
+                             ULONG condition = static_cast<ULONG>(page->Command.Argument2);
+                             ULONG processId = page->Command.Flags;
+                             UINT64 userCr3 = page->Command.Argument3;
+                             if (InterlockedCompareExchange(&shared->KiSessionEnabled, 0, 0) == 0 ||
+                                 InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&shared->KiSessionMode), 0, 0) !=
+                                     LMV_DEBUG_MODE_TRANSPARENT ||
+                                 InterlockedCompareExchange(&shared->Dr2WatchEnabled, 0, 0) != 0 ||
+                                 address == 0 || address >= 0x0000800000000000ull || processId == 0 ||
+                                 (length != 1 && length != 2 && length != 4 && length != 8) ||
+                                 address > 0x00007FFFFFFFFFFFull - (length - 1) ||
+                                 (address & (length - 1)) != 0 ||
+                                 (condition != LMV_DR2_CONDITION_WRITE && condition != LMV_DR2_CONDITION_READ_WRITE) ||
+                                 (userCr3 != 0 && ((userCr3 & ~shared->KiSessionCr3Mask) != 0 ||
+                                  (userCr3 & 0xfffULL) != 0)))
+                                 page->Result.Status = static_cast<ULONG>(STATUS_INVALID_PARAMETER);
+                             else
+                             {
+                                 shared->Dr2WatchUserCr3 = userCr3;
+                                 shared->Dr2WatchAddress = address;
+                                 shared->Dr2WatchLength = length;
+                                 shared->Dr2WatchCondition = condition;
+                                 shared->Dr2WatchProcessId = processId;
+                                 InterlockedExchange64(&shared->Dr2WatchHits, 0);
+                                 KeMemoryBarrier();
+                                 InterlockedExchange(&shared->Dr2WatchEnabled, 1);
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandRemoveDr2Watch)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             InterlockedExchange(&shared->Dr2WatchEnabled, 0);
+                             shared->Dr2WatchUserCr3 = 0;
+                             page->Result.Value0 = static_cast<UINT64>(
+                                 InterlockedCompareExchange64(&shared->Dr2WatchHits, 0, 0));
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandSetMode)
+                         {
+                             // Set debug mode and state (can be set before session starts)
+                             PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                             ULONG mode = static_cast<ULONG>(page->Command.Argument0);
+                             ULONG state = static_cast<ULONG>(page->Command.Argument1);
+
+                             // Validate mode
+                             if (mode != LMV_DEBUG_MODE_INTERACTIVE && mode != LMV_DEBUG_MODE_TRANSPARENT)
+                             {
+                                 page->Result.Status = LMV_CPUID_RESULT_INVALID_ARGUMENT;
+                             }
+                             else
+                             {
+                                 // Check if session is active (KiSessionEnabled != 0)
+                                 BOOLEAN sessionActive = InterlockedCompareExchange(&shared->KiSessionEnabled, 0, 0) != 0;
+                                 ULONG currentState = InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&shared->KiSessionState), 0, 0);
+
+                                 // Allow setting mode if:
+                                 // 1. Session not started yet (KiSessionEnabled == 0) - first-time setup
+                                 // 2. Current state is IDLE - between sessions
+                                 // 3. Re-setting same mode (idempotent)
+                                 if (sessionActive && currentState != LMV_SESSION_IDLE && currentState != state)
+                                 {
+                                     page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                                 }
+                                 else
+                                 {
+                                 // Set mode and state atomically
+                                 InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->KiSessionMode), static_cast<LONG>(mode));
+                                 InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->KiSessionState), static_cast<LONG>(state));
+
+                                 // Initialize mode-specific structures
+                                 if (mode == LMV_DEBUG_MODE_TRANSPARENT)
+                                 {
+                                     // Reset transparent mode event queue
+                                     InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->HostEventHead), 0);
+                                     InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->HostEventTail), 0);
+                                     InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->HostEventDropped), 0);
+                                     InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->TransparentModeErrorCount), 0);
+                                 }
+                                 else
+                                 {
+                                     // Reset interactive mode error counter
+                                     InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->InteractiveModeErrorCount), 0);
+                                 }
+
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 page->Result.Value0 = mode;
+                                 page->Result.Value1 = state;
+                             }
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandAttachProcess)
+                         {
+                             ULONG processId = static_cast<ULONG>(page->Command.Argument0);
+                             if (processId == 0)
+                                 page->Result.Status = LMV_CPUID_RESULT_INVALID_ARGUMENT;
+                             else if (InterlockedCompareExchange(&g_DebugAttached, 0, 0) != 0)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                             else
+                             {
+                                 g_DebugProcessId = processId;
+                                 KeMemoryBarrier();
+                                 InterlockedExchange(&g_DebugAttached, 1);
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 page->Result.Value0 = processId;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandDetachProcess)
+                         {
+                             ULONG processId = static_cast<ULONG>(page->Command.Argument0);
+                             ULONG attachedProcessId = g_DebugProcessId;
+                             if (InterlockedCompareExchange(&g_DebugAttached, 0, 0) == 0 ||
+                                 (processId != 0 && processId != attachedProcessId))
+                                 page->Result.Status = static_cast<ULONG>(STATUS_NOT_FOUND);
+                             else if (InterlockedCompareExchange(&
+                                 VpData->HostStackLayout.SharedVpData->DebugHook.State, 0, 0) != 0)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                             else
+                             {
+                                 g_DebugProcessId = 0;
+                                 KeMemoryBarrier();
+                                 InterlockedExchange(&g_DebugAttached, 0);
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandQueryState)
+                         {
+                             page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                             page->Result.Value0 = InterlockedCompareExchange(&g_DebugAttached, 0, 0);
+                             page->Result.Value1 = g_DebugProcessId;
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandInstallNptHook)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             PLMV_DBG_NPT_HOOK_REQUEST request = &page->DebugHookRequest;
+                             if (InterlockedCompareExchange(&g_DebugAttached, 0, 0) == 0 ||
+                                 request->ProcessId == 0 ||
+                                 request->ProcessId != g_DebugProcessId ||
+                                 request->GuestPhysicalAddress == 0)
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_INVALID_PARAMETER);
+                             }
+                             else if (InterlockedCompareExchange(&sharedVpData->DebugHook.State, 0, 0) != 0)
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                             }
+                             else if (!SvInstallNptDebugHook(
+                                         sharedVpData, request->ProcessId,
+                                         request->GuestPhysicalAddress, request->PatchOffset,
+                                         request->PatchBytes, request->PatchLength, nullptr))
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_UNSUCCESSFUL);
+                             }
+                             else
+                             {
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 page->Result.Value0 = request->Address;
+                                 page->Result.Value1 = request->GuestPhysicalAddress;
+                                 page->Result.Value2 = sharedVpData->DebugHook.OriginalHostPhysicalAddress;
+                                 page->Result.Value3 = sharedVpData->DebugHook.ShadowHostPhysicalAddress;
+                                 VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandArmExecProbe)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             UINT64 processId = page->Command.Argument0;
+                             if (processId == 0 || processId != g_DebugProcessId ||
+                                 InterlockedCompareExchange(&g_DebugAttached, 0, 0) == 0)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_ACCESS_DENIED);
+                             else if (!SvInstallNptExecProbe(
+                                          sharedVpData, static_cast<ULONG>(processId),
+                                          page->Command.Argument1, page->Command.Argument2,
+                                          page->Command.Argument3,
+                                          page->DebugHookRequest.Address))
+                                 page->Result.Status = static_cast<ULONG>(STATUS_UNSUCCESSFUL);
+                             else
+                             {
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandRemoveNptHook)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             if (sharedVpData->DebugHook.ExecuteProbe != 0 ||
+                                 InterlockedCompareExchange(&sharedVpData->DebugHook.State, 0, 0) == 0)
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_NOT_FOUND);
+                             }
+                             else if (page->Command.Argument0 != 0 &&
+                                      page->Command.Argument0 != sharedVpData->DebugHook.ProcessId)
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_NOT_FOUND);
+                             }
+                             else if (!SvRemoveNptDebugHook(sharedVpData, nullptr))
+                             {
+                                 page->Result.Status = static_cast<ULONG>(STATUS_UNSUCCESSFUL);
+                             }
+                             else
+                             {
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandDisarmExecProbe)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             if (sharedVpData->DebugHook.ExecuteProbe != 1 ||
+                                 page->Command.Argument0 != sharedVpData->DebugHook.ProcessId)
+                                 page->Result.Status = static_cast<ULONG>(STATUS_NOT_FOUND);
+                             else if (!SvRemoveNptDebugHook(sharedVpData, nullptr))
+                                 page->Result.Status = static_cast<ULONG>(STATUS_UNSUCCESSFUL);
+                             else
+                             {
+                                 page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                                 VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                             }
+                         }
+                         else if (page->Command.CommandId == LmvDebugCommandTranslateNpt)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             UINT64 hostPhysicalAddress = 0;
+                             page->Result.Status = SvTranslateNpt2Mb(
+                                 sharedVpData, page->Command.Argument0,
+                                 &hostPhysicalAddress) ?
+                                 LMV_CPUID_RESULT_SUCCESS :
+                                 static_cast<ULONG>(STATUS_INVALID_ADDRESS);
+                             page->Result.Value0 = hostPhysicalAddress;
+                         }                         else if (page->Command.CommandId == LmvDebugCommandReleaseNptHookRegion)
+                         {
+                             PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                 VpData->HostStackLayout.SharedVpData;
+                             page->Result.Status = SvReleaseNptDebugHookRegion(sharedVpData) ?
+                                 LMV_CPUID_RESULT_SUCCESS : static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                         }                         else if (page->Command.CommandId == LmvCpuidCommandQueryNptStats)
+                        {
+                            PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                VpData->HostStackLayout.SharedVpData;
+                            PHYSICAL_ADDRESS sharedPagePa = MmGetPhysicalAddress(
+                                &sharedVpData->SharedPage);
+                            page->Result.Status = LMV_CPUID_RESULT_SUCCESS;
+                            page->Result.Value0 = static_cast<UINT64>(
+                                InterlockedCompareExchange64(
+                                    &sharedVpData->VmExitTotal, 0, 0));
+                            page->Result.Value1 = static_cast<UINT64>(
+                                InterlockedCompareExchange64(
+                                    &sharedVpData->NpfTotal, 0, 0));
+                            page->Result.Value2 = sharedVpData->ProcessorCount;
+                            page->Result.Value3 = sharedPagePa.QuadPart;
+                        }
+                        else if (page->Command.CommandId >= LmvNptCommandRegisterPage &&
+                                 page->Command.CommandId <= LmvNptCommandReleaseRegion)
+                        {
+                            PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData =
+                                VpData->HostStackLayout.SharedVpData;
+                            UINT64 guestPhysicalAddress = page->Command.Argument0;
+                            PNPT_TEST_PAGE nptPage = nullptr;
+                            UINT64 hostPhysicalAddress = 0;
+                            ULONG operation = 0;
+                            ULONG nptStatus = LMV_NPT_TEST_STATUS_INVALID_ARGUMENT;
+
+                            switch (page->Command.CommandId)
+                            {
+                            case LmvNptCommandRegisterPage:
+                                operation = LMV_NPT_TEST_OPERATION_REGISTER_PAGE;
+                                break;
+                            case LmvNptCommandReadQword:
+                                operation = LMV_NPT_TEST_OPERATION_READ_QWORD;
+                                break;
+                            case LmvNptCommandRemapPage:
+                                operation = LMV_NPT_TEST_OPERATION_REMAP_PAGE;
+                                break;
+                            case LmvNptCommandRestorePage:
+                                operation = LMV_NPT_TEST_OPERATION_RESTORE_PAGE;
+                                break;
+                            case LmvNptCommandFlushTlb:
+                                operation = LMV_NPT_TEST_OPERATION_FLUSH_TLB;
+                                break;
+                            case LmvNptCommandArmWriteWatch:
+                                operation = LMV_NPT_TEST_OPERATION_ARM_WRITE_WATCH;
+                                break;
+                            case LmvNptCommandQueryWriteWatch:
+                                operation = LMV_NPT_TEST_OPERATION_QUERY_WRITE_WATCH;
+                                break;
+                            case LmvNptCommandDisarmWriteWatch:
+                                operation = LMV_NPT_TEST_OPERATION_DISARM_WRITE_WATCH;
+                                break;
+                            case LmvNptCommandReleaseRegion:
+                                operation = LMV_NPT_TEST_OPERATION_RELEASE_REGION;
+                                break;
+                            default:
+                                break;
+                            }
+
+                            switch (operation)
+                            {
+                            case LMV_NPT_TEST_OPERATION_REGISTER_PAGE:
+                                nptStatus = SvRegisterNptTestPage(sharedVpData, guestPhysicalAddress) ?
+                                    LMV_NPT_TEST_STATUS_SUCCESS : LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                break;
+                            case LMV_NPT_TEST_OPERATION_READ_QWORD:
+                                nptPage = SvFindNptTestPage(sharedVpData, guestPhysicalAddress);
+                                if ((guestPhysicalAddress & (PAGE_SIZE - 1)) == 0 &&
+                                    nptPage != nullptr &&
+                                    InterlockedCompareExchange(&nptPage->State,
+                                                               NPT_TEST_STATE_MAPPED,
+                                                               NPT_TEST_STATE_MAPPED) == NPT_TEST_STATE_MAPPED &&
+                                    SvTranslateNpt2Mb(sharedVpData, guestPhysicalAddress, &hostPhysicalAddress) &&
+                                    hostPhysicalAddress == nptPage->BackingPhysicalAddress)
+                                {
+                                    page->Result.Value0 = *reinterpret_cast<volatile UINT64*>(nptPage->BackingPage);
+                                    page->Result.Value1 = hostPhysicalAddress;
+                                    nptStatus = LMV_NPT_TEST_STATUS_SUCCESS;
+                                }
+                                else
+                                {
+                                    nptStatus = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_REMAP_PAGE:
+                                if ((guestPhysicalAddress & (PAGE_SIZE - 1)) == 0 &&
+                                    SvSetNptTestPageMapping(sharedVpData, guestPhysicalAddress, TRUE))
+                                {
+                                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                                    nptPage = SvFindNptTestPage(sharedVpData, guestPhysicalAddress);
+                                    hostPhysicalAddress = nptPage != nullptr ? nptPage->BackingPhysicalAddress : 0;
+                                    page->Result.Value1 = hostPhysicalAddress;
+                                    nptStatus = LMV_NPT_TEST_STATUS_SUCCESS;
+                                }
+                                else
+                                {
+                                    nptStatus = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_RESTORE_PAGE:
+                                nptStatus = SvSetNptTestPageMapping(sharedVpData, guestPhysicalAddress, FALSE) ?
+                                    LMV_NPT_TEST_STATUS_SUCCESS : LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                if (nptStatus == LMV_NPT_TEST_STATUS_SUCCESS)
+                                {
+                                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_FLUSH_TLB:
+                                VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                                nptStatus = LMV_NPT_TEST_STATUS_SUCCESS;
+                                break;
+                            case LMV_NPT_TEST_OPERATION_ARM_WRITE_WATCH:
+                                nptStatus = SvArmNptTestWriteWatch(sharedVpData, guestPhysicalAddress) ?
+                                    LMV_NPT_TEST_STATUS_SUCCESS : LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                if (nptStatus == LMV_NPT_TEST_STATUS_SUCCESS)
+                                {
+                                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_QUERY_WRITE_WATCH:
+                                nptPage = SvFindNptTestPage(sharedVpData, guestPhysicalAddress);
+                                if (nptPage != nullptr)
+                                {
+                                    page->Result.Value0 = static_cast<UINT64>(InterlockedCompareExchange64(&nptPage->WriteNpfCount, 0, 0));
+                                    page->Result.Value1 = static_cast<UINT64>(InterlockedCompareExchange64(&nptPage->WriteFaultGpa, 0, 0));
+                                    nptStatus = LMV_NPT_TEST_STATUS_SUCCESS;
+                                }
+                                else
+                                {
+                                    nptStatus = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_DISARM_WRITE_WATCH:
+                                nptStatus = SvDisarmNptTestWriteWatch(sharedVpData, guestPhysicalAddress) ?
+                                    LMV_NPT_TEST_STATUS_SUCCESS : LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                if (nptStatus == LMV_NPT_TEST_STATUS_SUCCESS)
+                                {
+                                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                                }
+                                break;
+                            case LMV_NPT_TEST_OPERATION_RELEASE_REGION:
+                                nptStatus = SvReleaseNptTestRegion(sharedVpData, guestPhysicalAddress) ?
+                                    LMV_NPT_TEST_STATUS_SUCCESS : LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                                break;
+                            default:
+                                break;
+                            }
+                            page->Result.Status = nptStatus;
+                        }
+                        else
+                        {
+                            page->Result.Status = LMV_CPUID_RESULT_UNSUPPORTED;
+                        }
+                        KeMemoryBarrier();
+                        page->Result.State = LMV_SHARED_STATE_COMPLETE;
+                        KeMemoryBarrier();
+                        InterlockedExchange(
+                            reinterpret_cast<volatile LONG*>(&page->State),
+                            LMV_SHARED_STATE_COMPLETE);
+                        status = page->Result.Status;
+                        flags = page->Result.Flags;
+                    }
+                    break;
+
+                case LmvCpuidCommandFlushNptTlb:
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    status = LMV_CPUID_RESULT_SUCCESS;
+                    break;
+
+                case LmvCpuidCommandSyncKiSession:
+                {
+                    PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                    if (shared->KiGuestRetired)
+                    {
+                        status = static_cast<ULONG>(STATUS_DELETE_PENDING);
+                        break;
+                    }
+
+                    // Sync debug mode from Guest (R13 contains mode)
+                    ULONG mode = static_cast<ULONG>(GuestContext->VpRegs->R13);
+                    if (mode == LMV_DEBUG_MODE_INTERACTIVE || mode == LMV_DEBUG_MODE_TRANSPARENT)
+                    {
+                        InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->KiSessionMode), static_cast<LONG>(mode));
+                    }
+
+                    if (InterlockedCompareExchange(&shared->KiSessionEnabled, 0, 0) != 0)
+                    {
+                        if (VpData->PrivateDr3Target != 0 && !VpData->PrivateDr3Persistent)
+                            status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                        else
+                        {
+                            if (!VpData->PrivateDr3Persistent)
+                                InterlockedIncrement(&shared->KiArmedProcessors);
+                            VpData->PrivateDr3Persistent = TRUE;
+                            VpData->PrivateDr3OneShot = FALSE;
+                            VpData->PrivateDr3Target = shared->KiSessionEntry;
+                            VpData->GuestVmcb.StateSaveArea.Dr7 =
+                                (VpData->GuestShadowDr7 & ~0xF00000C0ULL) | 0x40;
+                            status = LMV_CPUID_RESULT_SUCCESS;
+                        }
+                    }
+                    else
+                    {
+                        if (VpData->PrivateDr3Persistent)
+                        {
+                            VpData->PrivateDr3Target = 0;
+                            VpData->PrivateDr3Persistent = FALSE;
+                            InterlockedDecrement(&shared->KiArmedProcessors);
+                            VpData->GuestVmcb.StateSaveArea.Dr7 = VpData->GuestShadowDr7 & ~0xF00000C0ULL;
+                        }
+                        status = LMV_CPUID_RESULT_SUCCESS;
+                    }
+                    break;
+                }
+
+                case LmvCpuidCommandSyncDr2Watch:
+                {
+                    PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                    if (InterlockedCompareExchange(&shared->Dr2WatchEnabled, 0, 0) != 0 &&
+                        (VpData->GuestShadowDr7 & 0x30ULL) != 0)
+                        status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                    else
+                        status = LMV_CPUID_RESULT_SUCCESS;
+                    break;
+                }
+
+                case LmvCpuidCommandReadVirtualMemory:
+                case LmvCpuidCommandWriteVirtualMemory:
+                {
+                    // Handle virtual memory read/write via CR3 switch
+                    // Guest passes request via shared page
+                    PLMV_SHARED_PAGE page = &VpData->HostStackLayout.SharedVpData->SharedPage;
+                    PLMV_HOST_MEMORY_REQUEST request =
+                        reinterpret_cast<PLMV_HOST_MEMORY_REQUEST>(&page->Command.Argument0);
+
+                    if (request->Cr3 == 0 || request->VirtualAddress == 0 ||
+                        request->Length == 0 || request->Length > sizeof(request->Data))
+                    {
+                        status = LMV_CPUID_RESULT_INVALID_ARGUMENT;
+                    }
+                    else
+                    {
+                        // Perform CR3 switch and access virtual memory
+                        BOOLEAN success = SvReadWriteVirtualMemory(
+                            request->VirtualAddress,
+                            request->Cr3,
+                            request->Data,
+                            request->Length,
+                            commandId == LmvCpuidCommandWriteVirtualMemory);
+
+                        status = success ? LMV_CPUID_RESULT_SUCCESS :
+                                         static_cast<ULONG>(STATUS_PARTIAL_COPY);
+                    }
+                    break;
+                }
+
+                case LmvCpuidCommandPollHostEvents:
+                {
+                    // Poll Host event queue for transparent mode
+                    PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                    ULONG head = static_cast<ULONG>(InterlockedCompareExchange(
+                        reinterpret_cast<volatile LONG*>(&shared->HostEventHead), 0, 0));
+                    ULONG tail = static_cast<ULONG>(InterlockedCompareExchange(
+                        reinterpret_cast<volatile LONG*>(&shared->HostEventTail), 0, 0));
+
+                    if (head == tail)
+                    {
+                        // Queue empty
+                        status = static_cast<ULONG>(STATUS_NO_MORE_ENTRIES);
+                        flags = 0;
+                    }
+                    else
+                    {
+                        // Return queue status via registers
+                        status = LMV_CPUID_RESULT_SUCCESS;
+                        flags = (tail - head + HOST_EVENT_QUEUE_SIZE) % HOST_EVENT_QUEUE_SIZE; // Event count
+                        directResult = TRUE;
+                    }
+                    break;
+                }
+
+                case LmvCpuidCommandSubmitHostEvent:
+                {
+                    PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                    if (!shared->KiSessionEnabled || shared->KiSessionMode != LMV_DEBUG_MODE_TRANSPARENT ||
+                        (VpData->GuestVmcb.StateSaveArea.Cr3 & shared->KiSessionCr3Mask) != shared->KiSessionCr3 ||
+                        InterlockedCompareExchange64(&shared->KiInFlight, 0, 0) <= 0)
+                    {
+                        status = static_cast<ULONG>(STATUS_INVALID_DEVICE_STATE);
+                        break;
+                    }
+                    if (InterlockedCompareExchange(&shared->HostEventLock, 1, 0) != 0)
+                    {
+                        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&shared->HostEventDropped));
+                        status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                        break;
+                    }
+                    ULONG tail = shared->HostEventTail;
+                    ULONG nextTail = (tail + 1) % HOST_EVENT_QUEUE_SIZE;
+                    if (nextTail == shared->HostEventHead)
+                    {
+                        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&shared->HostEventDropped));
+                        status = static_cast<ULONG>(STATUS_BUFFER_OVERFLOW);
+                    }
+                    else
+                    {
+                        PHOST_EXCEPTION_EVENT event = &shared->HostEventQueue[tail];
+                        RtlCopyMemory(event, shared->SharedPage.Data, sizeof(*event));
+                        if (!event->ContextValid)
+                            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&shared->TransparentModeErrorCount));
+                        InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->HostEventTail),
+                            static_cast<LONG>(nextTail));
+                        status = LMV_CPUID_RESULT_SUCCESS;
+                    }
+                    InterlockedExchange(&shared->HostEventLock, 0);
+                    break;
+                }
+
+                case LmvCpuidCommandReadHostEvent:
+                {
+                    PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                    if (!shared->KiSessionEnabled || shared->KiSessionMode != LMV_DEBUG_MODE_TRANSPARENT)
+                    {
+                        status = static_cast<ULONG>(STATUS_INVALID_DEVICE_STATE);
+                        break;
+                    }
+                    if (InterlockedCompareExchange(&shared->HostEventLock, 1, 0) != 0)
+                    {
+                        status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                        break;
+                    }
+                    ULONG head = shared->HostEventHead;
+                    ULONG tail = shared->HostEventTail;
+                    if (head == tail)
+                        status = static_cast<ULONG>(STATUS_NO_MORE_ENTRIES);
+                    else
+                    {
+                        RtlCopyMemory(shared->SharedPage.Data, &shared->HostEventQueue[head],
+                            sizeof(HOST_EXCEPTION_EVENT));
+                        InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->HostEventHead),
+                            static_cast<LONG>((head + 1) % HOST_EVENT_QUEUE_SIZE));
+                        status = LMV_CPUID_RESULT_SUCCESS;
+                        flags = 1;
+                    }
+                    InterlockedExchange(&shared->HostEventLock, 0);
+                    break;
+                }
+
+                case LmvCpuidCommandReleaseKiGuest:
+                {
+                    PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                    if (!shared->KiGuestRetired || shared->KiGuestRegistered ||
+                        !LmvKiDrainComplete(InterlockedCompareExchange64(&shared->KiInFlight, 0, 0),
+                            InterlockedCompareExchange(&shared->KiArmedProcessors, 0, 0),
+                            shared->KiSessionEnabled ? LMV_KI_DRAIN_ENABLED : 0))
+                        status = static_cast<ULONG>(STATUS_DEVICE_BUSY);
+                    else
+                    {
+                        InterlockedExchange(&shared->KiGuestReleased, 1);
+                        g_HostDriverObject->DriverUnload = SvDriverUnload;
+                        status = LMV_CPUID_RESULT_SUCCESS;
+                    }
+                    break;
+                }
+                case LmvCpuidCommandQuerySharedPage:
+                {
+                    PHYSICAL_ADDRESS pagePa = MmGetPhysicalAddress(
+                        &VpData->HostStackLayout.SharedVpData->SharedPage);
+                    registers[0] = LMV_CPUID_RESULT_SUCCESS;
+                    registers[1] = static_cast<int>(pagePa.LowPart);
+                    registers[2] = static_cast<int>(pagePa.HighPart);
+                    registers[3] = LMV_SHARED_PAGE_MAGIC;
+                    SvDebugPrint("Shared page: VA=%p HPA=%llx Magic=%08x Version=%u Size=%u State=%u\n",
+                                 &VpData->HostStackLayout.SharedVpData->SharedPage,
+                                 pagePa.QuadPart,
+                                 VpData->HostStackLayout.SharedVpData->SharedPage.Magic,
+                                 VpData->HostStackLayout.SharedVpData->SharedPage.Version,
+                                 VpData->HostStackLayout.SharedVpData->SharedPage.Size,
+                                 VpData->HostStackLayout.SharedVpData->SharedPage.State);
+                    directResult = TRUE;
+                    break;
+                }
+
+                default:
+                    status = LMV_CPUID_RESULT_UNSUPPORTED;
+                    break;
+                }
+            }
+        }
+
+        if (directResult == FALSE)
+        {
+            registers[0] = static_cast<int>(status);
+            registers[1] = static_cast<int>(flags);
+            registers[2] = static_cast<int>(LMV_CPUID_PROTOCOL_VERSION);
+            registers[3] = static_cast<int>(sequence);
+        }
+    }
+    else if (static_cast<UINT32>(leaf) == LMV_NPT_TEST_CPUID)
+    {
+        PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData;
+        PNPT_TEST_PAGE testPage;
+        UINT64 guestPhysicalAddress;
+        UINT64 hostPhysicalAddress;
+        UINT64 value;
+        UINT32 operation;
+        UINT32 status;
+
+        sharedVpData = VpData->HostStackLayout.SharedVpData;
+        guestPhysicalAddress = (GuestContext->VpRegs->Rbx & MAXUINT32) |
+                               ((GuestContext->VpRegs->Rcx & MAXUINT32) << 32);
+        operation = static_cast<UINT32>(GuestContext->VpRegs->Rdx);
+        hostPhysicalAddress = 0;
+        value = 0;
+        status = LMV_NPT_TEST_STATUS_INVALID_ARGUMENT;
+
+        attribute.AsUInt16 = VpData->GuestVmcb.StateSaveArea.SsAttrib;
+        if (attribute.Fields.Dpl == DPL_SYSTEM)
+        {
+            switch (operation)
+            {
+            case LMV_NPT_TEST_OPERATION_REGISTER_PAGE:
+                if (SvRegisterNptTestPage(sharedVpData, guestPhysicalAddress))
+                {
+                    status = LMV_NPT_TEST_STATUS_SUCCESS;
+                }
+                break;
+
+            case LMV_NPT_TEST_OPERATION_REMAP_PAGE:
+                if ((guestPhysicalAddress & (PAGE_SIZE - 1)) == 0 &&
+                    SvSetNptTestPageMapping(sharedVpData, guestPhysicalAddress, TRUE))
+                {
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    testPage = SvFindNptTestPage(sharedVpData, guestPhysicalAddress);
+                    hostPhysicalAddress = testPage->BackingPhysicalAddress;
+                    status = LMV_NPT_TEST_STATUS_SUCCESS;
+                    SvDebugPrint("NPT remap installed: GPA=%llx HPA=%llx\n",
+                                 guestPhysicalAddress,
+                                 hostPhysicalAddress);
+                }
+                else
+                {
+                    status = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                }
+                break;
+
+            case LMV_NPT_TEST_OPERATION_RESTORE_PAGE:
+                if (SvSetNptTestPageMapping(sharedVpData, guestPhysicalAddress, FALSE))
+                {
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    status = LMV_NPT_TEST_STATUS_SUCCESS;
+                    SvDebugPrint("NPT remap restored: GPA=%llx\n",
+                                 guestPhysicalAddress);
+                }
+                else
+                {
+                    status = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                }
+                break;
+
+            case LMV_NPT_TEST_OPERATION_RELEASE_REGION:
+                if (SvReleaseNptTestRegion(sharedVpData, guestPhysicalAddress))
+                {
+                    status = LMV_NPT_TEST_STATUS_SUCCESS;
+                }
+                else
+                {
+                    status = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                }
+                break;
+
+            case LMV_NPT_TEST_OPERATION_FLUSH_TLB:
+                VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                status = LMV_NPT_TEST_STATUS_SUCCESS;
+                break;
+
+            case LMV_NPT_TEST_OPERATION_ARM_WRITE_WATCH:
+                if (SvArmNptTestWriteWatch(sharedVpData, guestPhysicalAddress))
+                {
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    status = LMV_NPT_TEST_STATUS_SUCCESS;
+                }
+                else
+                {
+                    status = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                }
+                break;
+
+            case LMV_NPT_TEST_OPERATION_QUERY_WRITE_WATCH:
+                testPage = SvFindNptTestPage(sharedVpData, guestPhysicalAddress);
+                if (testPage != nullptr &&
+                    InterlockedCompareExchange(&testPage->State,
+                                               NPT_TEST_STATE_MAPPED,
+                                               NPT_TEST_STATE_MAPPED) == NPT_TEST_STATE_MAPPED)
+                {
+                    value = static_cast<UINT64>(InterlockedCompareExchange64(
+                        &testPage->WriteNpfCount, 0, 0));
+                    status = LMV_NPT_TEST_STATUS_SUCCESS;
+                    SvDebugPrint("NPT write-watch query: GPA=%llx faultGPA=%llx Info1=%llx NPF=%llx\n",
+                                 guestPhysicalAddress,
+                                 static_cast<UINT64>(InterlockedCompareExchange64(
+                                     &testPage->WriteFaultGpa, 0, 0)),
+                                 static_cast<UINT64>(InterlockedCompareExchange64(
+                                     &testPage->WriteFaultInfo1, 0, 0)),
+                                 value);
+                }
+                break;
+
+            case LMV_NPT_TEST_OPERATION_DISARM_WRITE_WATCH:
+                if (SvDisarmNptTestWriteWatch(sharedVpData, guestPhysicalAddress))
+                {
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    status = LMV_NPT_TEST_STATUS_SUCCESS;
+                }
+                else
+                {
+                    status = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                }
+                break;
+
+            case LMV_NPT_TEST_OPERATION_READ_QWORD:
+                testPage = SvFindNptTestPage(sharedVpData, guestPhysicalAddress);
+                if ((guestPhysicalAddress & (PAGE_SIZE - 1)) == 0 &&
+                    testPage != nullptr &&
+                    InterlockedCompareExchange(&testPage->State,
+                                               NPT_TEST_STATE_MAPPED,
+                                               NPT_TEST_STATE_MAPPED) ==
+                        NPT_TEST_STATE_MAPPED &&
+                    SvTranslateNpt2Mb(sharedVpData, guestPhysicalAddress,
+                                      &hostPhysicalAddress) &&
+                    hostPhysicalAddress == testPage->BackingPhysicalAddress)
+                {
+                    value = *reinterpret_cast<volatile UINT64*>(
+                        testPage->BackingPage);
+                    status = LMV_NPT_TEST_STATUS_SUCCESS;
+                    SvDebugPrint("NPT remap read: GPA=%llx HPA=%llx value=%llx status=%u\n",
+                                 guestPhysicalAddress,
+                                 hostPhysicalAddress,
+                                 value,
+                                 status);
+                }
+                else
+                {
+                    status = LMV_NPT_TEST_STATUS_MAPPING_FAILED;
+                    SvDebugPrint("NPT remap read failed: GPA=%llx HPA=%llx\n",
+                                 guestPhysicalAddress,
+                                 hostPhysicalAddress);
+                }
+                break;
+            }
+        }
+
+        registers[0] = static_cast<int>(value & MAXUINT32);
+        registers[1] = static_cast<int>(value >> 32);
+        registers[2] = static_cast<int>(status);
+        registers[3] = 0;
+    }
+    else
+    {
+        // **Stealth only in non-nested mode**
+        // When nested SVM is active, preserve hypervisor CPUID leaves from nested driver
+        if (!VpData->NestedActive &&
+            static_cast<UINT32>(leaf) >= 0x40000000 &&
+            static_cast<UINT32>(leaf) <= 0x400000FF)
+        {
+            // Non-nested: Hide hypervisor vendor signature
+            registers[0] = 0;
+            registers[1] = 0;
+            registers[2] = 0;
+            registers[3] = 0;
+        }
+        else
+        {
+            // Nested mode OR non-hypervisor leaves: call physical CPUID
+            __cpuidex(registers, leaf, subLeaf);
+        }
+    }
+
+    switch (leaf)
+    {
+    case CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS:
+        //
+        // **Stealth in non-nested mode only**
+        // When nested SVM is active, preserve hypervisor characteristics from nested driver
+        // so detection tools see the nested hypervisor, not our L0 layer.
+        //
+        if (!VpData->NestedActive)
+        {
+            registers[2] &= ~CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT;
+        }
+        break;
+    case CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS_EX:
+        if (VpData->NestedActive)
+        {
+            registers[2] &= ~CPUID_FN8000_0001_ECX_SVM;
+        }
+        break;
+    case CPUID_SVM_FEATURES:
+        if (VpData->NestedActive)
+        {
+            registers[0] = 0;
+            registers[1] = 0;
+            registers[2] = 0;
+            registers[3] = 0;
+        }
+        else
+        {
+            registers[3] &= ~CPUID_FN8000_000A_EDX_NP;
+        }
+        break;
+    case CPUID_HV_VENDOR_AND_MAX_FUNCTIONS:
+    case CPUID_HV_INTERFACE:
+        //
+        // **Stealth already handled in pre-switch logic (line 2316-2331)**
+        // Non-nested mode: already returned zeros
+        // Nested mode: already returned __cpuidex results (nested driver's signature)
+        // Do not override here.
+        //
+        break;
+    case 0x4C4D5654:  // "LMVT" - Covert communication channel
+        //
+        // This is our internal magic leaf for stealth hypervisor detection.
+        // Return magic number 0x53564D4C ("SVML") to confirm our presence.
+        // Used by SvIsSimpleSvmHypervisorInstalled to detect if virtualized.
+        //
+        registers[0] = 0x53564D4C;  // "SVML" magic return value
+        registers[1] = 0x00010000;  // Version 1.0
+        registers[2] = 0x00000001;  // Status: virtualized
+        registers[3] = 0;           // Reserved
+        break;
+    case CPUID_UNLOAD_SIMPLE_SVM:
+        if (subLeaf == CPUID_UNLOAD_SIMPLE_SVM)
+        {
+            //
+            // Unload itself if the request is from the kernel mode.
+            //
+            attribute.AsUInt16 = VpData->GuestVmcb.StateSaveArea.SsAttrib;
+            if (!VpData->NestedActive && attribute.Fields.Dpl == DPL_SYSTEM &&
+                !VpData->HostStackLayout.SharedVpData->KiGuestRegistered &&
+                (!VpData->HostStackLayout.SharedVpData->KiGuestRetired ||
+                    VpData->HostStackLayout.SharedVpData->KiGuestReleased) &&
+                !VpData->HostStackLayout.SharedVpData->KiSessionEnabled &&
+                InterlockedCompareExchange64(&VpData->HostStackLayout.SharedVpData->KiInFlight, 0, 0) == 0)
+            {
+                GuestContext->ExitVm = TRUE;
+            }
+        }
+        break;
+    default:
+        break;
+    }
+
+    //
+    // Update guest's GPRs with results.
+    //
+    GuestContext->VpRegs->Rax = registers[0];
+    GuestContext->VpRegs->Rbx = registers[1];
+    GuestContext->VpRegs->Rcx = registers[2];
+    GuestContext->VpRegs->Rdx = registers[3];
+
+    //
+    // Debug prints results. Very important to note that any use of API from
+    // the host context is unsafe and absolutely avoided, unless the API is
+    // documented to be accessible on IRQL IPI_LEVEL+. This is because
+    // interrupts are disabled when host code is running, and IPI is not going
+    // to be delivered when it is issued.
+    //
+    // This code is not exception and violating this rule. The reasons for this
+    // code are to demonstrate a bad example, and simply show that the SimpleSvm
+    // is functioning for a test purpose.
+    //
+#if LMV_ENABLE_CPUID_TRACE
+    if (KeGetCurrentIrql() <= DISPATCH_LEVEL)
+    {
+        SvDebugPrint("CPUID: %08x-%08x : %08x %08x %08x %08x\n",
+                     leaf,
+                     subLeaf,
+                     registers[0],
+                     registers[1],
+                     registers[2],
+                     registers[3]);
+    }
+#endif
+
+    //
+    // Then, advance RIP to "complete" the instruction.
+    //
+    VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+}
+
+/*!
+    @brief          Handles #VMEXIT due to execution of the WRMSR and RDMSR
+                    instructions.
+
+     @details        This virtualizes the SVM control MSRs independently for the
+                     outer guest and nested guest. The real host EFER and
+                     VM_HSAVE_PA are never modified on behalf of a guest.
+
+    @param[in,out]  VpData - Per processor data.
+    @param[in,out]  GuestContext - Guest's GPRs.
+ */
+_IRQL_requires_same_
+static
+VOID
+SvHandleMsrAccess (
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _Inout_ PGUEST_CONTEXT GuestContext
+    )
+{
+    ULARGE_INTEGER value;
+    UINT32 msr;
+    BOOLEAN writeAccess;
+
+    msr = GuestContext->VpRegs->Rcx & MAXUINT32;
+    writeAccess = (VpData->GuestVmcb.ControlArea.ExitInfo1 != 0);
+
+    if (msr == SVM_MSR_VM_HSAVE_PA || msr == SVM_MSR_VM_CR)
+    {
+        UINT64* target = msr == SVM_MSR_VM_HSAVE_PA ?
+            (VpData->NestedActive ? &VpData->NestedL2VirtualVmHsavePa :
+                                    &VpData->NestedVirtualVmHsavePa) :
+            (VpData->NestedActive ? &VpData->NestedL2VirtualVmCr :
+                                    &VpData->NestedVirtualVmCr);
+
+        if (writeAccess != FALSE)
+        {
+            value.LowPart = GuestContext->VpRegs->Rax & MAXUINT32;
+            value.HighPart = GuestContext->VpRegs->Rdx & MAXUINT32;
+            if (msr == SVM_MSR_VM_HSAVE_PA)
+            {
+                if ((value.QuadPart & (PAGE_SIZE - 1)) != 0 ||
+                    value.QuadPart > kNestedPhysicalAddressMask)
+                {
+                    SvInjectGeneralProtectionException(VpData);
+                    return;
+                }
+                *target = value.QuadPart;
+            }
+            else
+            {
+                if ((value.QuadPart & ~static_cast<UINT64>(SVM_VM_CR_VALID_MASK)) != 0)
+                {
+                    SvInjectGeneralProtectionException(VpData);
+                    return;
+                }
+                UINT64 currentVmCr = *target & SVM_VM_CR_VALID_MASK;
+                UINT64 requestedVmCr = value.QuadPart & SVM_VM_CR_VALID_MASK;
+                if (VpData->NestedActive &&
+                    (requestedVmCr & SVM_VM_CR_SVMDIS) == 0)
+                {
+                    SvInjectGeneralProtectionException(VpData);
+                    return;
+                }
+                if ((currentVmCr & SVM_VM_CR_LOCK) != 0)
+                {
+                    requestedVmCr =
+                        (requestedVmCr & ~(SVM_VM_CR_LOCK | SVM_VM_CR_SVMDIS)) |
+                        (currentVmCr & (SVM_VM_CR_LOCK | SVM_VM_CR_SVMDIS));
+                }
+                UINT64* efer = VpData->NestedActive ?
+                    &VpData->NestedL2VirtualEfer :
+                    &VpData->NestedVirtualEfer;
+                if ((requestedVmCr & SVM_VM_CR_SVMDIS) != 0 &&
+                    (*efer & EFER_SVME) != 0)
+                {
+                    SvInjectGeneralProtectionException(VpData);
+                    return;
+                }
+                *target = requestedVmCr;
+            }
+        }
+        else
+        {
+            value.QuadPart = *target;
+            GuestContext->VpRegs->Rax = value.LowPart;
+            GuestContext->VpRegs->Rdx = value.HighPart;
+        }
+
+        VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+        return;
+    }
+
+    //
+    // Protect EFER.SVME while keeping a separate virtual EFER for the outer
+    // guest. While a nested guest is active, its VMCB state is the source of
+    // truth for EFER and is copied back to VMCB12 on a reflected exit.
+    //
+    if (msr == IA32_MSR_EFER)
+    {
+        if (writeAccess != FALSE)
+        {
+            value.LowPart = GuestContext->VpRegs->Rax & MAXUINT32;
+            value.HighPart = GuestContext->VpRegs->Rdx & MAXUINT32;
+            UINT64* vmCr = VpData->NestedActive ?
+                &VpData->NestedL2VirtualVmCr : &VpData->NestedVirtualVmCr;
+            if ((value.QuadPart & ~kNestedEferValidMask) != 0 ||
+                ((value.QuadPart & EFER_SVME) != 0 &&
+                 (*vmCr & SVM_VM_CR_SVMDIS) != 0))
+            {
+                SvInjectGeneralProtectionException(VpData);
+                return;
+            }
+
+            if (VpData->NestedActive)
+                VpData->NestedL2VirtualEfer = value.QuadPart;
+            else
+                VpData->NestedVirtualEfer = value.QuadPart;
+            VpData->GuestVmcb.StateSaveArea.Efer = value.QuadPart | EFER_SVME;
+        }
+        else
+        {
+            value.QuadPart = VpData->NestedActive ?
+                VpData->NestedL2VirtualEfer : VpData->NestedVirtualEfer;
+            GuestContext->VpRegs->Rax = value.LowPart;
+            GuestContext->VpRegs->Rdx = value.HighPart;
+        }
+
+        VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+        return;
+    }
+    else
+    {
+        if (VpData->NestedActive)
+        {
+            SvInjectGeneralProtectionException(VpData);
+            return;
+        }
+
+        //
+        // If the MSR being accessed is not IA32_MSR_EFER, assert that #VMEXIT
+        // can only occur on access to MSR outside the ranges controlled with
+        // the MSR permissions map. This is true because the map is configured
+        // not to intercept any MSR access but IA32_MSR_EFER. See
+        // "MSR Ranges Covered by MSRPM" in "MSR Intercepts" for the MSR ranges
+        // controlled by the map.
+        //
+        // Note that VMware Workstation has a bug that access to unimplemented
+        // MSRs unconditionally causes #VMEXIT ignoring bits in the MSR
+        // permissions map. This can be tested by reading MSR zero, for example.
+        //
+        NT_ASSERT(((msr > 0x00001fff) && (msr < 0xc0000000)) ||
+                  ((msr > 0xc0001fff) && (msr < 0xc0010000)) ||
+                   (msr > 0xc0011fff));
+
+        //
+        // Execute WRMSR or RDMSR on behalf of the guest. Important that this
+        // can cause bug check when the guest tries to access unimplemented MSR
+        // *even within the SEH block* because the below WRMSR or RDMSR raises
+        // #GP and are not protected by the SEH block (or cannot be protected
+        // either as this code run outside the thread stack region Windows
+        // requires to proceed SEH). Hypervisors typically handle this by noop-ing
+        // WRMSR and returning zero for RDMSR with non-architecturally defined
+        // MSRs. Alternatively, one can probe which MSRs should cause #GP prior
+        // to installation of a hypervisor and the hypervisor can emulate the
+        // results.
+        //
+        if (writeAccess != FALSE)
+        {
+            value.LowPart = GuestContext->VpRegs->Rax & MAXUINT32;
+            value.HighPart = GuestContext->VpRegs->Rdx & MAXUINT32;
+            __writemsr(msr, value.QuadPart);
+        }
+        else
+        {
+            value.QuadPart = __readmsr(msr);
+            GuestContext->VpRegs->Rax = value.LowPart;
+            GuestContext->VpRegs->Rdx = value.HighPart;
+        }
+    }
+
+    //
+    // Then, advance RIP to "complete" the instruction.
+    //
+    VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+}
+
+static BOOLEAN SvBuildNestedPermissionMaps(
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    VMCB_CONTROL_AREA* control = &VpData->NestedVmcb12.ControlArea;
+
+    RtlZeroMemory(VpData->NestedL1MsrPermissionsMap,
+                  SVM_MSR_PERMISSIONS_MAP_SIZE);
+    RtlZeroMemory(VpData->NestedMsrPermissionsMap,
+                  SVM_MSR_PERMISSIONS_MAP_SIZE);
+    RtlZeroMemory(VpData->NestedIoPermissionsMap,
+                  SVM_IO_PERMISSIONS_MAP_SIZE);
+
+    if ((control->InterceptMisc1 & SVM_INTERCEPT_MISC1_MSR_PROT) != 0 &&
+        (control->MsrpmBasePa == 0 ||
+         (control->MsrpmBasePa & (PAGE_SIZE - 1)) != 0 ||
+         !SvIsNestedPhysicalRangeMapped(VpData,
+                                        control->MsrpmBasePa,
+                                        SVM_MSR_PERMISSIONS_MAP_SIZE) ||
+         !SvCopyNestedGuestPhysical(VpData,
+                                    control->MsrpmBasePa,
+                                    VpData->NestedL1MsrPermissionsMap,
+                                    SVM_MSR_PERMISSIONS_MAP_SIZE,
+                                    FALSE)))
+    {
+        return FALSE;
+    }
+
+    if ((control->InterceptMisc1 & SVM_INTERCEPT_MISC1_IOIO) != 0 &&
+        (control->IopmBasePa == 0 ||
+         (control->IopmBasePa & (PAGE_SIZE - 1)) != 0 ||
+         !SvIsNestedPhysicalRangeMapped(VpData,
+                                        control->IopmBasePa,
+                                        SVM_IO_PERMISSIONS_MAP_SIZE) ||
+         !SvCopyNestedGuestPhysical(VpData,
+                                    control->IopmBasePa,
+                                    VpData->NestedIoPermissionsMap,
+                                    SVM_IO_PERMISSIONS_MAP_SIZE,
+                                    FALSE)))
+    {
+        return FALSE;
+    }
+
+    RtlCopyMemory(VpData->NestedMsrPermissionsMap,
+                  VpData->NestedL1MsrPermissionsMap,
+                  SVM_MSR_PERMISSIONS_MAP_SIZE);
+    SvSetMsrPermissions(static_cast<UCHAR*>(VpData->NestedMsrPermissionsMap),
+                        IA32_MSR_EFER, TRUE, TRUE);
+    SvSetMsrPermissions(static_cast<UCHAR*>(VpData->NestedMsrPermissionsMap),
+                        SVM_MSR_VM_CR, TRUE, TRUE);
+    SvSetMsrPermissions(static_cast<UCHAR*>(VpData->NestedMsrPermissionsMap),
+                        SVM_MSR_VM_HSAVE_PA, TRUE, TRUE);
+    return TRUE;
+}
+
+struct NESTED_STATE_RANGE
+{
+    ULONG Offset;
+    ULONG Length;
+};
+
+static const NESTED_STATE_RANGE kNestedVmloadRanges[] =
+{
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, FsSelector), 0x20 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, LdtrSelector), 0x10 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, TrSelector), 0x10 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Star), 0x40 }
+};
+
+static const NESTED_STATE_RANGE kNestedVmexitRanges[] =
+{
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, EsSelector), 0x40 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, GdtrSelector), 0x10 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, IdtrSelector), 0x10 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Cpl), sizeof(UINT8) },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Efer), sizeof(UINT64) },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Cr4), 0x38 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Rsp), sizeof(UINT64) },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Rax), sizeof(UINT64) },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Cr2), sizeof(UINT64) },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, GPat), sizeof(UINT64) }
+};
+
+static const NESTED_STATE_RANGE kNestedHsaveRanges[] =
+{
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, EsSelector), 0x40 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, GdtrSelector), 0x10 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, IdtrSelector), 0x10 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Cpl), sizeof(UINT8) },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Efer), sizeof(UINT64) },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Cr4), 0x38 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Rsp), sizeof(UINT64) },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Rax), sizeof(UINT64) },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Star), 0x40 },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, Cr2), sizeof(UINT64) },
+    { FIELD_OFFSET(VMCB_STATE_SAVE_AREA, GPat), sizeof(UINT64) }
+};
+
+static VOID SvCopyVmloadState(_Inout_ PVMCB_STATE_SAVE_AREA Destination,
+                             _In_ const VMCB_STATE_SAVE_AREA* Source)
+{
+    for (const NESTED_STATE_RANGE& range : kNestedVmloadRanges)
+        RtlCopyMemory(reinterpret_cast<PUCHAR>(Destination) + range.Offset,
+                      reinterpret_cast<const UCHAR*>(Source) + range.Offset,
+                      range.Length);
+}
+
+static BOOLEAN SvWriteNestedStateRanges(_In_ PVIRTUAL_PROCESSOR_DATA VpData,
+                                        _In_ UINT64 VmcbGpa,
+                                        _In_ const VMCB_STATE_SAVE_AREA* State,
+                                        _In_reads_(Count) const NESTED_STATE_RANGE* Ranges,
+                                        _In_ ULONG Count)
+{
+    for (ULONG index = 0; index < Count; ++index)
+    {
+        if (!SvCopyNestedGuestPhysical(VpData,
+              VmcbGpa + FIELD_OFFSET(VMCB, StateSaveArea) + Ranges[index].Offset,
+              const_cast<PUCHAR>(reinterpret_cast<const UCHAR*>(State)) + Ranges[index].Offset,
+              Ranges[index].Length, TRUE))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOLEAN SvWriteNestedExit(_In_ PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    VMCB_CONTROL_AREA* control = &VpData->NestedVmcb12.ControlArea;
+    UINT64 vmcbGpa = VpData->NestedL1VmcbGpa;
+    return SvCopyNestedGuestPhysical(VpData,
+              vmcbGpa + FIELD_OFFSET(VMCB_CONTROL_AREA, ExitCode),
+              &control->ExitCode, 0x20, TRUE) &&
+           SvCopyNestedGuestPhysical(VpData,
+              vmcbGpa + FIELD_OFFSET(VMCB_CONTROL_AREA, NRip),
+              &control->NRip, 0x18, TRUE) &&
+           SvCopyNestedGuestPhysical(VpData,
+              vmcbGpa + FIELD_OFFSET(VMCB_CONTROL_AREA, InterruptShadow),
+              &control->InterruptShadow, sizeof(control->InterruptShadow), TRUE) &&
+           SvCopyNestedGuestPhysical(VpData,
+              vmcbGpa + FIELD_OFFSET(VMCB_CONTROL_AREA, EventInj),
+              &control->EventInj, sizeof(control->EventInj), TRUE) &&
+           SvCopyNestedGuestPhysical(VpData,
+              vmcbGpa + FIELD_OFFSET(VMCB_CONTROL_AREA, VmcbClean),
+              &control->VmcbClean, sizeof(control->VmcbClean), TRUE) &&
+           SvWriteNestedStateRanges(VpData, vmcbGpa, &VpData->NestedVmcb12.StateSaveArea,
+                                     kNestedVmexitRanges, RTL_NUMBER_OF(kNestedVmexitRanges)) &&
+           SvWriteNestedStateRanges(VpData, vmcbGpa, &VpData->NestedVmcb12.StateSaveArea,
+                                     kNestedVmloadRanges, RTL_NUMBER_OF(kNestedVmloadRanges));
+}
+
+static BOOLEAN SvCheckSvmInstructionAccess(_Inout_ PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    UINT64 efer = VpData->NestedActive ?
+        VpData->NestedL2VirtualEfer : VpData->NestedVirtualEfer;
+    UINT64 vmCr = VpData->NestedActive ?
+        VpData->NestedL2VirtualVmCr : VpData->NestedVirtualVmCr;
+    if ((efer & EFER_SVME) == 0)
+    {
+        EVENTINJ event = {};
+        event.Fields.Vector = 6;
+        event.Fields.Type = 3;
+        event.Fields.Valid = 1;
+        VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+        SvRecordNestedTrace(VpData, NestedTraceReject, NestedFailurePermission);
+        return FALSE;
+    }
+    if (VpData->GuestVmcb.StateSaveArea.Cpl != 0 || (vmCr & SVM_VM_CR_SVMDIS) != 0)
+    {
+        SvInjectGeneralProtectionException(VpData);
+        SvRecordNestedTrace(VpData, NestedTraceReject, NestedFailurePermission);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static VOID SvReturnNestedInvalid(_Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+                                 _In_ NESTED_SVM_FAILURE Failure)
+{
+    VpData->NestedVmcb12.ControlArea.ExitCode = static_cast<UINT64>(VMEXIT_INVALID);
+    VpData->NestedVmcb12.ControlArea.ExitInfo1 = 0;
+    VpData->NestedVmcb12.ControlArea.ExitInfo2 = 0;
+    VpData->NestedVmcb12.ControlArea.ExitIntInfo = 0;
+    VpData->NestedVmcb12.ControlArea.NRip = 0;
+    VpData->NestedVmcb12.ControlArea.NumOfBytesFetched = 0;
+    RtlZeroMemory(VpData->NestedVmcb12.ControlArea.GuestInstructionBytes,
+                  sizeof(VpData->NestedVmcb12.ControlArea.GuestInstructionBytes));
+    SvRecordNestedTrace(VpData, NestedTraceReject, Failure);
+    if (!SvWriteNestedExit(VpData))
+    {
+        SvInjectGeneralProtectionException(VpData);
+        SvRecordNestedTrace(VpData, NestedTraceReject, NestedFailureWriteback);
+        return;
+    }
+    VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+}
+
+static VOID SvEnterNestedGuest(
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _Inout_ PGUEST_CONTEXT GuestContext
+    )
+{
+    UINT64 vmcbGpa = GuestContext->VpRegs->Rax;
+    if (!SvCheckSvmInstructionAccess(VpData))
+        return;
+    if (VpData->NestedActive)
+    {
+        SvInjectGeneralProtectionException(VpData);
+        SvRecordNestedTrace(VpData, NestedTraceReject, NestedFailureUnsupported);
+        return;
+    }
+    VpData->NestedL1VmcbGpa = vmcbGpa;
+    if (VpData->NestedVirtualVmHsavePa == 0 ||
+        (VpData->NestedVirtualVmHsavePa & (PAGE_SIZE - 1)) != 0 ||
+        !SvIsNestedPhysicalRangeMapped(VpData, VpData->NestedVirtualVmHsavePa, PAGE_SIZE) ||
+        vmcbGpa == VpData->NestedVirtualVmHsavePa ||
+        !SvReadNestedVmcb(VpData, vmcbGpa, &VpData->NestedVmcb12))
+    {
+        SvInjectGeneralProtectionException(VpData);
+        SvRecordNestedTrace(VpData, NestedTraceReject, NestedFailureAddress);
+        return;
+    }
+    if ((VpData->NestedVmcb12.ControlArea.NpEnable & SVM_NP_ENABLE_NP_ENABLE) != 0 ||
+        VpData->NestedVmcb12.ControlArea.LbrVirtualizationEnable != 0 ||
+        (VpData->NestedVmcb12.ControlArea.VIntr & ((1ULL << 25) | (1ULL << 26))) != 0 ||
+        VpData->NestedVmcb12.ControlArea.AvicApicBar != 0)
+    {
+        SvReturnNestedInvalid(VpData, NestedFailureUnsupported);
+        return;
+    }
+    if (!SvIsNestedVmcbValid(VpData, &VpData->NestedVmcb12))
+    {
+        SvReturnNestedInvalid(VpData, NestedFailureInvalidVmcb);
+        return;
+    }
+    if (!SvBuildNestedPermissionMaps(VpData))
+    {
+        SvReturnNestedInvalid(VpData, NestedFailurePermissionMap);
+        return;
+    }
+
+    VpData->NestedL1Vmcb = VpData->GuestVmcb;
+    VpData->NestedL1Registers = *GuestContext->VpRegs;
+    VpData->NestedL1VmcbGpa = vmcbGpa;
+    VpData->NestedL1VmrunRip = VpData->GuestVmcb.ControlArea.NRip;
+    VpData->NestedL1Vmcb.StateSaveArea.Rip = VpData->NestedL1VmrunRip;
+    VpData->NestedL1Vmcb.StateSaveArea.Rax = GuestContext->VpRegs->Rax;
+    VMCB_STATE_SAVE_AREA nestedHostState = VpData->NestedL1Vmcb.StateSaveArea;
+    if (!SvWriteNestedStateRanges(VpData, VpData->NestedVirtualVmHsavePa,
+                                  &nestedHostState, kNestedHsaveRanges,
+                                  RTL_NUMBER_OF(kNestedHsaveRanges)))
+    {
+        SvInjectGeneralProtectionException(VpData);
+        SvRecordNestedTrace(VpData, NestedTraceReject, NestedFailureWriteback);
+        return;
+    }
+    VpData->NestedL2VirtualVmHsavePa = 0;
+    VpData->NestedL2VirtualVmCr =
+        VpData->NestedVirtualVmCr | SVM_VM_CR_SVMDIS;
+    VpData->NestedL2Dr2 = 0;
+    VpData->NestedL2Dr3 = 0;
+    VpData->NestedL2Dr7 = VpData->NestedVmcb12.StateSaveArea.Dr7;
+    VpData->NestedL2VirtualGif = TRUE;
+
+    VpData->NestedL2BaseInterceptMisc1 = VpData->NestedL1Vmcb.ControlArea.InterceptMisc1;
+    VpData->GuestVmcb = VpData->NestedVmcb12;
+    VpData->NestedL2VirtualEfer = VpData->GuestVmcb.StateSaveArea.Efer & ~EFER_SVME;
+    VpData->GuestVmcb.StateSaveArea.Efer |= EFER_SVME;
+    VpData->GuestVmcb.ControlArea.InterceptCrRead |=
+        VpData->NestedL1Vmcb.ControlArea.InterceptCrRead;
+    VpData->GuestVmcb.ControlArea.InterceptCrWrite |=
+        VpData->NestedL1Vmcb.ControlArea.InterceptCrWrite;
+    VpData->GuestVmcb.ControlArea.InterceptDrRead |=
+        VpData->NestedL1Vmcb.ControlArea.InterceptDrRead;
+    VpData->GuestVmcb.ControlArea.InterceptDrWrite |=
+        VpData->NestedL1Vmcb.ControlArea.InterceptDrWrite;
+    VpData->GuestVmcb.ControlArea.InterceptException |=
+        VpData->NestedL1Vmcb.ControlArea.InterceptException;
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 |=
+        VpData->NestedVmcb12.ControlArea.InterceptMisc1 | VpData->NestedL2BaseInterceptMisc1;
+    VpData->GuestVmcb.ControlArea.InterceptMisc2 |=
+        VpData->NestedL1Vmcb.ControlArea.InterceptMisc2;
+    VpData->GuestVmcb.ControlArea.InterceptException |= 3;
+    VpData->GuestVmcb.ControlArea.InterceptDrRead |= (1u << 2) | (1u << 3) | (1u << 7);
+    VpData->GuestVmcb.ControlArea.InterceptDrWrite |= (1u << 2) | (1u << 3) | (1u << 7);
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 |=
+        SVM_INTERCEPT_MISC1_CPUID | SVM_INTERCEPT_MISC1_MSR_PROT |
+        SVM_INTERCEPT_MISC1_INVLPGA;
+    VpData->GuestVmcb.ControlArea.InterceptMisc2 |=
+        SVM_INTERCEPT_MISC2_VMRUN | SVM_INTERCEPT_MISC2_VMMCALL |
+        SVM_INTERCEPT_MISC2_VMLOAD | SVM_INTERCEPT_MISC2_VMSAVE |
+        SVM_INTERCEPT_MISC2_STGI | SVM_INTERCEPT_MISC2_CLGI |
+        SVM_INTERCEPT_MISC2_SKINIT;
+    VpData->GuestVmcb.ControlArea.MsrpmBasePa = VpData->NestedMsrpmPa;
+    VpData->GuestVmcb.ControlArea.IopmBasePa = VpData->NestedIopmPa;
+    VpData->GuestVmcb.ControlArea.GuestAsid = 1;
+    VpData->GuestVmcb.ControlArea.NpEnable = SVM_NP_ENABLE_NP_ENABLE;
+    VpData->GuestVmcb.ControlArea.NCr3 = VpData->NestedL1Vmcb.ControlArea.NCr3;
+    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+    VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+    VpData->NestedL1NptEnabled = FALSE;
+    VpData->NestedL2PendingNmi = FALSE;
+    VpData->NestedActive = TRUE;
+    GuestContext->VpRegs->Rax = VpData->GuestVmcb.StateSaveArea.Rax;
+    SvRecordNestedTrace(VpData, NestedTraceEnter);
+}
+
+/*!
+    @brief          Handles #VMEXIT due to execution of the VMRUN instruction.
+
+    @details        This function always injects #GP to the guest.
+
+    @param[in,out]  VpData - Per processor data.
+    @param[in,out]  GuestContext - Guest's GPRs.
+ */
+_IRQL_requires_same_
+static
+VOID
+SvHandleVmrun (
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _Inout_ PGUEST_CONTEXT GuestContext
+    )
+{
+    SvEnterNestedGuest(VpData, GuestContext);
+}
+
+static BOOLEAN SvNestedShouldReflectExit(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _In_ PGUEST_REGISTERS GuestRegisters
+    )
+{
+    const VMCB_CONTROL_AREA* control = &VpData->NestedVmcb12.ControlArea;
+    UINT64 exitCode = VpData->GuestVmcb.ControlArea.ExitCode;
+
+    if (exitCode == static_cast<UINT64>(VMEXIT_INVALID))
+    {
+        return TRUE;
+    }
+
+    if (exitCode >= VMEXIT_EXCEPTION_DE && exitCode <= VMEXIT_EXCEPTION_31)
+    {
+        UINT32 vector = static_cast<UINT32>(exitCode - VMEXIT_EXCEPTION_DE);
+        return (control->InterceptException & (1u << vector)) != 0;
+    }
+    if (exitCode >= VMEXIT_DR0_READ && exitCode <= VMEXIT_DR15_READ)
+        return (control->InterceptDrRead & (1u << (exitCode - VMEXIT_DR0_READ))) != 0;
+    if (exitCode >= VMEXIT_DR0_WRITE && exitCode <= VMEXIT_DR15_WRITE)
+        return (control->InterceptDrWrite & (1u << (exitCode - VMEXIT_DR0_WRITE))) != 0;
+
+    if (exitCode <= VMEXIT_CR15_READ)
+        return (control->InterceptCrRead & (1u << (exitCode - VMEXIT_CR0_READ))) != 0;
+    if (exitCode >= VMEXIT_CR0_WRITE && exitCode <= VMEXIT_CR15_WRITE)
+        return (control->InterceptCrWrite & (1u << (exitCode - VMEXIT_CR0_WRITE))) != 0;
+
+    switch (exitCode)
+    {
+    case VMEXIT_INTR:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_INTR) != 0;
+    case VMEXIT_NMI:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_NMI) != 0;
+    case VMEXIT_SMI:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_SMI) != 0;
+    case VMEXIT_INIT:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_INIT) != 0;
+    case VMEXIT_VINTR:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_VINTR) != 0;
+    case VMEXIT_CR0_SEL_WRITE:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_CR0_SEL) != 0;
+    case VMEXIT_IDTR_READ:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_IDTR_READ) != 0;
+    case VMEXIT_GDTR_READ:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_GDTR_READ) != 0;
+    case VMEXIT_LDTR_READ:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_LDTR_READ) != 0;
+    case VMEXIT_TR_READ:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_TR_READ) != 0;
+    case VMEXIT_IDTR_WRITE:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_IDTR_WRITE) != 0;
+    case VMEXIT_GDTR_WRITE:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_GDTR_WRITE) != 0;
+    case VMEXIT_LDTR_WRITE:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_LDTR_WRITE) != 0;
+    case VMEXIT_TR_WRITE:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_TR_WRITE) != 0;
+    case VMEXIT_RDTSC:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_RDTSC) != 0;
+    case VMEXIT_RDPMC:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_RDPMC) != 0;
+    case VMEXIT_PUSHF:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_PUSHF) != 0;
+    case VMEXIT_POPF:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_POPF) != 0;
+    case VMEXIT_RSM:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_RSM) != 0;
+    case VMEXIT_IRET:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_IRET) != 0;
+    case VMEXIT_SWINT:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_SWINT) != 0;
+    case VMEXIT_INVD:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_INVD) != 0;
+    case VMEXIT_PAUSE:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_PAUSE) != 0;
+    case VMEXIT_HLT:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_HLT) != 0;
+    case VMEXIT_INVLPG:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_INVLPG) != 0;
+    case VMEXIT_TASK_SWITCH:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_TASK_SWITCH) != 0;
+    case VMEXIT_FERR_FREEZE:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_FERR_FREEZE) != 0;
+    case VMEXIT_SHUTDOWN:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_SHUTDOWN) != 0;
+    case VMEXIT_CPUID:
+        if ((control->InterceptMisc1 & SVM_INTERCEPT_MISC1_CPUID) != 0)
+        {
+            return TRUE;
+        }
+        return FALSE;
+    case VMEXIT_MSR:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_MSR_PROT) != 0 &&
+            SvGetMsrPermission(static_cast<const UCHAR*>(VpData->NestedL1MsrPermissionsMap),
+                               static_cast<UINT32>(GuestRegisters->Rcx),
+                               VpData->GuestVmcb.ControlArea.ExitInfo1 != 0);
+    case VMEXIT_INVLPGA:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_INVLPGA) != 0;
+    case VMEXIT_IOIO:
+        return (control->InterceptMisc1 & SVM_INTERCEPT_MISC1_IOIO) != 0;
+    case VMEXIT_VMRUN:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_VMRUN) != 0;
+    case VMEXIT_VMMCALL:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_VMMCALL) != 0;
+    case VMEXIT_VMLOAD:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_VMLOAD) != 0;
+    case VMEXIT_VMSAVE:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_VMSAVE) != 0;
+    case VMEXIT_STGI:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_STGI) != 0;
+    case VMEXIT_CLGI:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_CLGI) != 0;
+    case VMEXIT_SKINIT:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_SKINIT) != 0;
+    case VMEXIT_RDTSCP:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_RDTSCP) != 0;
+    case VMEXIT_ICEBP:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_ICEBP) != 0;
+    case VMEXIT_WBINVD:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_WBINVD) != 0;
+    case VMEXIT_MONITOR:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_MONITOR) != 0;
+    case VMEXIT_MWAIT:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_MWAIT) != 0;
+    case VMEXIT_MWAIT_CONDITIONAL:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_MWAIT_COND) != 0;
+    case VMEXIT_XSETBV:
+        return (control->InterceptMisc2 & SVM_INTERCEPT_MISC2_XSETBV) != 0;
+    case VMEXIT_CR0_WRITE_TRAP:
+    case VMEXIT_CR1_WRITE_TRAP:
+    case VMEXIT_CR2_WRITE_TRAP:
+    case VMEXIT_CR3_WRITE_TRAP:
+    case VMEXIT_CR4_WRITE_TRAP:
+    case VMEXIT_CR5_WRITE_TRAP:
+    case VMEXIT_CR6_WRITE_TRAP:
+    case VMEXIT_CR7_WRITE_TRAP:
+    case VMEXIT_CR8_WRITE_TRAP:
+    case VMEXIT_CR9_WRITE_TRAP:
+    case VMEXIT_CR10_WRITE_TRAP:
+    case VMEXIT_CR11_WRITE_TRAP:
+    case VMEXIT_CR12_WRITE_TRAP:
+    case VMEXIT_CR13_WRITE_TRAP:
+    case VMEXIT_CR14_WRITE_TRAP:
+    case VMEXIT_CR15_WRITE_TRAP:
+        return (control->InterceptCrWrite &
+                (1u << (exitCode - VMEXIT_CR0_WRITE_TRAP))) != 0;
+    default:
+        return FALSE;
+    }
+}
+
+static VOID SvAbortNestedGuest(
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _Inout_ PGUEST_REGISTERS GuestRegisters
+    );
+
+static VOID SvReflectNestedExit(
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _Inout_ PGUEST_REGISTERS GuestRegisters
+    )
+{
+    VMCB_STATE_SAVE_AREA reflectedState = VpData->GuestVmcb.StateSaveArea;
+    UINT64 reflectedRax = GuestRegisters->Rax;
+    VpData->NestedVmcb12.StateSaveArea = reflectedState;
+    VpData->NestedVmcb12.StateSaveArea.Efer = VpData->NestedL2VirtualEfer;
+    VpData->NestedVmcb12.StateSaveArea.Rax = reflectedRax;
+    VpData->NestedVmcb12.ControlArea.ExitCode = VpData->GuestVmcb.ControlArea.ExitCode;
+    VpData->NestedVmcb12.ControlArea.ExitInfo1 = VpData->GuestVmcb.ControlArea.ExitInfo1;
+    VpData->NestedVmcb12.ControlArea.ExitInfo2 = VpData->GuestVmcb.ControlArea.ExitInfo2;
+    VpData->NestedVmcb12.ControlArea.ExitIntInfo = VpData->GuestVmcb.ControlArea.ExitIntInfo;
+    VpData->NestedVmcb12.ControlArea.EventInj = VpData->GuestVmcb.ControlArea.EventInj;
+    VpData->NestedVmcb12.ControlArea.InterruptShadow = VpData->GuestVmcb.ControlArea.InterruptShadow;
+    VpData->NestedVmcb12.ControlArea.NRip = VpData->GuestVmcb.ControlArea.NRip;
+    VpData->NestedVmcb12.ControlArea.NumOfBytesFetched =
+        VpData->GuestVmcb.ControlArea.NumOfBytesFetched;
+    RtlCopyMemory(VpData->NestedVmcb12.ControlArea.GuestInstructionBytes,
+                  VpData->GuestVmcb.ControlArea.GuestInstructionBytes,
+                  sizeof(VpData->NestedVmcb12.ControlArea.GuestInstructionBytes));
+    VpData->NestedVmcb12.ControlArea.VmcbClean = 0;
+    SvRecordNestedTrace(VpData, NestedTraceReflect);
+
+    if (!SvWriteNestedExit(VpData))
+    {
+        SvAbortNestedGuest(VpData, GuestRegisters);
+        return;
+    }
+
+    // Restore L1's GPRs that were saved when entering nested guest
+    *GuestRegisters = VpData->NestedL1Registers;
+
+    // Update RAX with the value from L1 VMCB (used by VMLOAD)
+    GuestRegisters->Rax = VpData->NestedL1Vmcb.StateSaveArea.Rax;
+
+    // Exit nested state
+    VpData->NestedActive = FALSE;
+    VpData->NestedL2VirtualEfer = 0;
+    VpData->NestedVirtualGif = FALSE;
+
+    // Restore L1 VMCB as the active guest
+    VpData->GuestVmcb = VpData->NestedL1Vmcb;
+
+    // Set L1's RIP to the instruction after VMRUN (the VMEXIT handler entry point)
+    VpData->GuestVmcb.StateSaveArea.Rip = VpData->NestedL1VmrunRip;
+
+    // Sync RAX to VMCB
+    VpData->GuestVmcb.StateSaveArea.Rax = GuestRegisters->Rax;
+
+    // Force TLB flush on next VMRUN
+    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+}
+
+static VOID SvAbortNestedGuest(
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _Inout_ PGUEST_REGISTERS GuestRegisters
+    )
+{
+    SvRecordNestedTrace(VpData, NestedTraceAbort, NestedFailureWriteback);
+    VpData->NestedActive = FALSE;
+    VpData->NestedL2VirtualEfer = 0;
+    VpData->GuestVmcb = VpData->NestedL1Vmcb;
+    *GuestRegisters = VpData->NestedL1Registers;
+    VpData->GuestVmcb.StateSaveArea.Rip = VpData->NestedL1VmrunRip;
+    SvInjectGeneralProtectionException(VpData);
+}
+
+extern "C"
+VOID
+NTAPI
+SvEnterGuestDebugState(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    __writedr(3, VpData->PrivateDr3Target != 0 ?
+        VpData->PrivateDr3Target : VpData->OriginalHostDr3);
+    __writedr(7, VpData->OriginalHostDr7);
+}
+
+extern "C"
+VOID
+NTAPI
+SvLeaveGuestDebugState(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    __writedr(3, VpData->OriginalHostDr3);
+    __writedr(7, VpData->OriginalHostDr7);
+}
+
+extern "C"
+VOID
+NTAPI
+SvEnterGuestDr2WatchState(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    SvSyncDr2WatchState(VpData);
+    PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+    __writedr(2, VpData->NestedActive ? VpData->NestedL2Dr2 :
+        (VpData->Dr2WatchApplied &&
+        InterlockedCompareExchange(&shared->Dr2WatchEnabled, 0, 0) != 0 ?
+        shared->Dr2WatchAddress : VpData->GuestShadowDr2));
+}
+
+extern "C"
+VOID
+NTAPI
+SvLeaveGuestDr2WatchState(
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    __writedr(2, VpData->OriginalHostDr2);
+}
+
+static VOID SvInjectNestedException(_Inout_ PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    UINT64 exitCode = VpData->GuestVmcb.ControlArea.ExitCode;
+    EVENTINJ event = {};
+
+    if (exitCode < VMEXIT_EXCEPTION_DE || exitCode > VMEXIT_EXCEPTION_31)
+    {
+        SvInjectGeneralProtectionException(VpData);
+        return;
+    }
+    event.Fields.Vector = static_cast<UINT32>(exitCode - VMEXIT_EXCEPTION_DE);
+    event.Fields.Type = 3;
+    event.Fields.Valid = 1;
+    if (event.Fields.Vector == 8 ||
+        (event.Fields.Vector >= 10 && event.Fields.Vector <= 14) ||
+        event.Fields.Vector == 17 || event.Fields.Vector == 21)
+    {
+        event.Fields.ErrorCodeValid = 1;
+        event.Fields.ErrorCode = static_cast<UINT32>(
+            VpData->GuestVmcb.ControlArea.ExitInfo1);
+    }
+    VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+}
+
+static BOOLEAN SvCanExecuteSvmInstruction(
+    _In_ const VIRTUAL_PROCESSOR_DATA* VpData
+    )
+{
+    UINT64 efer = VpData->NestedActive ?
+        VpData->NestedL2VirtualEfer : VpData->NestedVirtualEfer;
+    UINT64 vmCr = VpData->NestedActive ?
+        VpData->NestedL2VirtualVmCr : VpData->NestedVirtualVmCr;
+
+    return VpData->GuestVmcb.StateSaveArea.Cpl == 0 &&
+           (efer & EFER_SVME) != 0 &&
+           (vmCr & SVM_VM_CR_SVMDIS) == 0;
+}
+
+static VOID SvHandleSvmStateInstruction(
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _Inout_ PGUEST_REGISTERS GuestRegisters,
+    _In_ BOOLEAN Save
+    )
+{
+    VMCB vmcb;
+    UINT64 vmcbGpa = GuestRegisters->Rax;
+    if (!SvCheckSvmInstructionAccess(VpData))
+        return;
+    if (!SvReadNestedVmcb(VpData, vmcbGpa, &vmcb))
+    {
+        SvInjectGeneralProtectionException(VpData);
+        SvRecordNestedTrace(VpData, NestedTraceReject, NestedFailureAddress);
+        return;
+    }
+
+    if (Save)
+    {
+        SvCopyVmloadState(&vmcb.StateSaveArea, &VpData->GuestVmcb.StateSaveArea);
+        if (!SvWriteNestedStateRanges(VpData, vmcbGpa, &vmcb.StateSaveArea,
+                                      kNestedVmloadRanges, RTL_NUMBER_OF(kNestedVmloadRanges)))
+        {
+            SvInjectGeneralProtectionException(VpData);
+            SvRecordNestedTrace(VpData, NestedTraceReject, NestedFailureWriteback);
+            return;
+        }
+    }
+    else
+    {
+        SvCopyVmloadState(&VpData->GuestVmcb.StateSaveArea, &vmcb.StateSaveArea);
+    }
+
+    VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+    SvRecordNestedTrace(VpData, NestedTraceState);
+}
+
+static VOID SvHandleSvmControlInstruction(
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    UINT64 exitCode = VpData->GuestVmcb.ControlArea.ExitCode;
+    BOOLEAN* gif = VpData->NestedActive ?
+        &VpData->NestedL2VirtualGif : &VpData->NestedVirtualGif;
+    if (!SvCheckSvmInstructionAccess(VpData))
+        return;
+
+    switch (exitCode)
+    {
+    case VMEXIT_STGI:
+        *gif = TRUE;
+        VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+        SvRecordNestedTrace(VpData, NestedTraceGif);
+        break;
+    case VMEXIT_CLGI:
+        *gif = FALSE;
+        VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+        SvRecordNestedTrace(VpData, NestedTraceGif);
+        break;
+    case VMEXIT_INVLPGA:
+        VpData->GuestVmcb.ControlArea.TlbControl = 1;
+        VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+        break;
+    default:
+        SvInjectGeneralProtectionException(VpData);
+        break;
+    }
+}
+
+static UINT64* SvGuestDebugOperand(PVIRTUAL_PROCESSOR_DATA vp, PGUEST_REGISTERS regs, ULONG index)
+{
+    switch (index & 0xf)
+    {
+    case 0: return &regs->Rax; case 1: return &regs->Rcx; case 2: return &regs->Rdx;
+    case 3: return &regs->Rbx; case 4: return &vp->GuestVmcb.StateSaveArea.Rsp;
+    case 5: return &regs->Rbp; case 6: return &regs->Rsi; case 7: return &regs->Rdi;
+    case 8: return &regs->R8; case 9: return &regs->R9; case 10: return &regs->R10;
+    case 11: return &regs->R11; case 12: return &regs->R12; case 13: return &regs->R13;
+    case 14: return &regs->R14; case 15: return &regs->R15; default: return nullptr;
+    }
+}
+
+static VOID SvHandleReservedDebugRegister(PVIRTUAL_PROCESSOR_DATA vp, PGUEST_REGISTERS regs)
+{
+    UINT64 exitCode = vp->GuestVmcb.ControlArea.ExitCode;
+    UINT64* operand = SvGuestDebugOperand(vp, regs,
+        static_cast<ULONG>(vp->GuestVmcb.ControlArea.ExitInfo1 & 0xf));
+    if (operand == nullptr)
+    {
+        SvInjectGeneralProtectionException(vp);
+        return;
+    }
+    switch (exitCode)
+    {
+    case VMEXIT_DR2_WRITE:
+        if (vp->NestedActive)
+            vp->NestedL2Dr2 = *operand;
+        else
+            vp->GuestShadowDr2 = *operand;
+        break;
+    case VMEXIT_DR2_READ:
+        *operand = vp->NestedActive ? vp->NestedL2Dr2 :
+            (vp->Dr2WatchApplied &&
+            InterlockedCompareExchange(&vp->HostStackLayout.SharedVpData->Dr2WatchEnabled, 0, 0) != 0 ?
+            vp->HostStackLayout.SharedVpData->Dr2WatchAddress : vp->GuestShadowDr2);
+        break;
+    case VMEXIT_DR3_WRITE:
+        if (vp->NestedActive)
+            vp->NestedL2Dr3 = *operand;
+        else
+            vp->GuestShadowDr3 = *operand;
+        break;
+    case VMEXIT_DR3_READ:
+        *operand = vp->NestedActive ? vp->NestedL2Dr3 : vp->GuestShadowDr3;
+        break;
+    case VMEXIT_DR7_WRITE:
+        if (vp->NestedActive)
+            vp->NestedL2Dr7 = *operand;
+        else
+            vp->GuestShadowDr7 = *operand;
+        vp->GuestVmcb.StateSaveArea.Dr7 = ((vp->NestedActive ?
+            vp->NestedL2Dr7 : vp->GuestShadowDr7) & ~0xF00000C0ULL) |
+            (vp->PrivateDr3Target != 0 ? 0x40ULL : 0);
+        break;
+    case VMEXIT_DR7_READ:
+        *operand = vp->NestedActive ? vp->NestedL2Dr7 : vp->GuestShadowDr7;
+        if (!vp->NestedActive && vp->Dr2WatchApplied &&
+            InterlockedCompareExchange(&vp->HostStackLayout.SharedVpData->Dr2WatchEnabled, 0, 0) != 0)
+            *operand = (*operand & ~kDr2WatchDr7Mask) |
+                SvBuildDr2WatchDr7(vp->HostStackLayout.SharedVpData);
+        break;
+    default: SvInjectGeneralProtectionException(vp); return;
+    }
+    vp->GuestVmcb.StateSaveArea.Rip = vp->GuestVmcb.ControlArea.NRip;
+}
+
+static VOID SvRecordDr2WatchHit(PVIRTUAL_PROCESSOR_DATA vp, PGUEST_REGISTERS regs, UINT64 debugStatus)
+{
+    PSHARED_VIRTUAL_PROCESSOR_DATA shared = vp->HostStackLayout.SharedVpData;
+    if (InterlockedCompareExchange(&shared->Dr2WatchEnabled, 0, 0) == 0 ||
+        InterlockedCompareExchange(&shared->KiSessionEnabled, 0, 0) == 0 ||
+        InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&shared->KiSessionMode), 0, 0) !=
+            LMV_DEBUG_MODE_TRANSPARENT ||
+        ((vp->GuestVmcb.StateSaveArea.Cr3 & shared->KiSessionCr3Mask) != shared->KiSessionCr3 &&
+         (shared->Dr2WatchUserCr3 == 0 ||
+          (vp->GuestVmcb.StateSaveArea.Cr3 & shared->KiSessionCr3Mask) != shared->Dr2WatchUserCr3)))
+        return;
+
+    InterlockedIncrement64(&shared->Dr2WatchHits);
+    if (InterlockedCompareExchange(&shared->HostEventLock, 1, 0) != 0)
+    {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&shared->HostEventDropped));
+        return;
+    }
+
+    ULONG tail = shared->HostEventTail;
+    ULONG nextTail = (tail + 1) % HOST_EVENT_QUEUE_SIZE;
+    if (nextTail == shared->HostEventHead)
+    {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&shared->HostEventDropped));
+        InterlockedExchange(&shared->HostEventLock, 0);
+        return;
+    }
+
+    HOST_EXCEPTION_EVENT event = {};
+    event.Rip = vp->GuestVmcb.StateSaveArea.Rip;
+    event.Rsp = vp->GuestVmcb.StateSaveArea.Rsp;
+    event.Rflags = vp->GuestVmcb.StateSaveArea.Rflags;
+    event.Rax = regs->Rax;
+    event.Rbx = regs->Rbx;
+    event.Rcx = regs->Rcx;
+    event.Rdx = regs->Rdx;
+    event.Rsi = regs->Rsi;
+    event.Rdi = regs->Rdi;
+    event.Rbp = regs->Rbp;
+    event.R8 = regs->R8;
+    event.R9 = regs->R9;
+    event.R10 = regs->R10;
+    event.R11 = regs->R11;
+    event.R12 = regs->R12;
+    event.R13 = regs->R13;
+    event.R14 = regs->R14;
+    event.R15 = regs->R15;
+    event.Cr3 = vp->GuestVmcb.StateSaveArea.Cr3;
+    event.Dr6 = debugStatus;
+    event.Timestamp = __rdtsc();
+    event.ExceptionType = 1;
+    event.ProcessId = shared->Dr2WatchProcessId;
+    event.ThreadId = 0;
+    event.Reserved = HOST_EVENT_KIND_DR2_WATCH;
+    event.ExceptionAddress = shared->Dr2WatchAddress;
+    event.ExceptionInformation[0] = shared->Dr2WatchAddress;
+    event.ExceptionInformation[1] = shared->Dr2WatchLength;
+    event.ExceptionInformation[2] = shared->Dr2WatchCondition;
+    event.ExceptionInformation[3] = vp->GuestVmcb.StateSaveArea.Cpl;
+    event.NumberParameters = 4;
+    event.FirstChance = 1;
+    event.CaptureStatus = STATUS_SUCCESS;
+    event.ContextValid = 1;
+    RtlCopyMemory(&shared->HostEventQueue[tail], &event, sizeof(event));
+    KeMemoryBarrier();
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->HostEventTail), static_cast<LONG>(nextTail));
+    InterlockedExchange(&shared->HostEventLock, 0);
+}
+
+/*!
+    @brief          C-level entry point of the host code called from SvLaunchVm.
+
+    @details        This function loads save host state first, and then, handles
+                    #VMEXIT which may or may not change guest's state via VpData
+                    or GuestRegisters.
+
+                    Interrupts are disabled when this function is called due to
+                    the cleared GIF. Not all host state are loaded yet, so do it
+                    with the VMLOAD instruction.
+
+                    If the #VMEXIT handler detects a request to unload the
+                    hypervisor, this function loads guest state, disables SVM
+                    and returns to execution flow where the #VMEXIT triggered.
+
+    @param[in,out]  VpData - Per processor data.
+    @param[in,out]  GuestRegisters - Guest's GPRs.
+
+    @result         TRUE when virtualization is terminated; otherwise FALSE.
+ */
+_IRQL_requires_same_
+EXTERN_C
+BOOLEAN
+NTAPI
+SvHandleVmExit (
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _Inout_ PGUEST_REGISTERS GuestRegisters
+    )
+{
+    GUEST_CONTEXT guestContext;
+    KIRQL oldIrql;
+
+    guestContext.VpRegs = GuestRegisters;
+    guestContext.ExitVm = FALSE;
+    guestContext.ResumeAtCurrentRip = FALSE;
+    VpData->GuestVmcb.ControlArea.TlbControl = 0;
+    if (VpData->GuestVmcb.ControlArea.ExitCode != VMEXIT_NPF)
+    {
+        VpData->NptWatchRetryCount = 0;
+    }
+    InterlockedIncrement64(&VpData->VmExitCount);
+    InterlockedIncrement64(&VpData->HostStackLayout.SharedVpData->VmExitTotal);
+
+    //
+    // Load some host state that are not loaded on #VMEXIT.
+    //
+    __svm_vmload(VpData->HostStackLayout.HostVmcbPa);
+    SvLeaveGuestDebugState(VpData);
+    SvLeaveGuestDr2WatchState(VpData);
+
+    NT_ASSERT(VpData->HostStackLayout.Reserved1 == MAXUINT64);
+
+    //
+    // Raise the IRQL to the DISPATCH_LEVEL level. This has no actual effect since
+    // interrupts are disabled at #VMEXI but warrants bug check when some of
+    // kernel API that are not usable on this context is called with Driver
+    // Verifier. This protects developers from accidentally writing such #VMEXIT
+    // handling code. This should actually raise IRQL to HIGH_LEVEL to represent
+    // this running context better, but our Logger code is not designed to run at
+    // that level unfortunately. Finally, note that this API is a thin wrapper
+    // of mov-to-CR8 on x64 and safe to call on this context.
+    //
+    oldIrql = KeGetCurrentIrql();
+    if (oldIrql < DISPATCH_LEVEL)
+    {
+        KeRaiseIrqlToDpcLevel();
+    }
+
+    //
+    // Guest's RAX is overwritten by the host's value on #VMEXIT and saved in
+    // the VMCB instead. Reflect the guest RAX to the context.
+    //
+    GuestRegisters->Rax = VpData->GuestVmcb.StateSaveArea.Rax;
+
+    //
+    // Update the _KTRAP_FRAME structure values in hypervisor stack, so that
+    // Windbg can reconstruct call stack of the guest during debug session.
+    // This is optional but very useful thing to do for debugging.
+    //
+    VpData->HostStackLayout.TrapFrame.Rsp = VpData->GuestVmcb.StateSaveArea.Rsp;
+    VpData->HostStackLayout.TrapFrame.Rip = VpData->GuestVmcb.ControlArea.NRip;
+
+    if (VpData->NestedActive &&
+        SvNestedShouldReflectExit(VpData, GuestRegisters))
+    {
+        SvReflectNestedExit(VpData, GuestRegisters);
+        goto VmExitHandled;
+    }
+
+    //
+    // Handle #VMEXIT according with its reason.
+    //
+    switch (VpData->GuestVmcb.ControlArea.ExitCode)
+    {
+    case VMEXIT_EXCEPTION_DE:
+    {
+        EVENTINJ event;
+
+        SvDebugPrint("#DE VMEXIT: CPU=%hu:%hu RIP=%llx RSP=%llx CR3=%llx RAX=%llx\n",
+                     VpData->ProcessorGroup,
+                     VpData->ProcessorNumber,
+                     VpData->GuestVmcb.StateSaveArea.Rip,
+                     VpData->GuestVmcb.StateSaveArea.Rsp,
+                     VpData->GuestVmcb.StateSaveArea.Cr3,
+                     GuestRegisters->Rax);
+
+        event.AsUInt64 = 0;
+        event.Fields.Vector = 0;
+        event.Fields.Type = 3;
+        event.Fields.Valid = 1;
+        VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+        break;
+    }
+    case VMEXIT_DR2_READ:
+    case VMEXIT_DR2_WRITE:
+    case VMEXIT_DR3_READ:
+    case VMEXIT_DR3_WRITE:
+    case VMEXIT_DR7_READ:
+    case VMEXIT_DR7_WRITE:
+        SvHandleReservedDebugRegister(VpData, GuestRegisters);
+        break;
+    case VMEXIT_EXCEPTION_DB:
+    {
+        UINT64 debugStatus = VpData->GuestVmcb.StateSaveArea.Dr6;
+        if ((debugStatus & (1ULL << 13)) != 0)
+            VpData->GuestShadowDr7 &= ~(1ULL << 13);
+        if ((debugStatus & 4ULL) != 0 && VpData->Dr2WatchApplied)
+        {
+            SvRecordDr2WatchHit(VpData, GuestRegisters, debugStatus);
+            debugStatus &= ~4ULL;
+            VpData->GuestVmcb.StateSaveArea.Dr6 = debugStatus;
+            if ((debugStatus & 0xE007ULL) == 0)
+                break;
+        }
+        if (VpData->PrivateDr3Target != 0 &&
+            (debugStatus & 8) != 0 &&
+            VpData->GuestVmcb.StateSaveArea.Rip == VpData->PrivateDr3Target)
+        {
+            if (VpData->PrivateDr3Persistent)
+            {
+                PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+                BOOLEAN target = InterlockedCompareExchange(&shared->KiSessionEnabled, 0, 0) != 0 &&
+                    (VpData->GuestVmcb.StateSaveArea.Cr3 & shared->KiSessionCr3Mask) == shared->KiSessionCr3 &&
+                    (GuestRegisters->R9 & 0xff) == UserMode;
+
+                // Check if in transparent mode
+                ULONG sessionMode = static_cast<ULONG>(InterlockedCompareExchange(
+                    reinterpret_cast<volatile LONG*>(&shared->KiSessionMode), 0, 0));
+
+                if (target && sessionMode == LMV_DEBUG_MODE_TRANSPARENT)
+                {
+                    InterlockedIncrement64(&shared->KiInFlight);
+                    VpData->GuestVmcb.StateSaveArea.Rip = shared->KiSessionEventStub;
+                }
+                else if (target)
+                {
+                    // Interactive mode: redirect to Event Stub
+                    InterlockedIncrement64(&shared->KiInFlight);
+                    VpData->GuestVmcb.StateSaveArea.Rip = shared->KiSessionEventStub;
+                }
+                else
+                {
+                    // Not target process: redirect to Pass Stub
+                    InterlockedIncrement64(&shared->KiInFlight);
+                    VpData->GuestVmcb.StateSaveArea.Rip = shared->KiSessionPassStub;
+                }
+            }
+            else if (VpData->PrivateDr3OneShot)
+            {
+                VpData->PrivateDr3LastRip = VpData->GuestVmcb.StateSaveArea.Rip;
+                VpData->PrivateDr3LastDr6 = debugStatus;
+                VpData->PrivateDr3LastCr3 = VpData->GuestVmcb.StateSaveArea.Cr3;
+                VpData->PrivateDr3LastRcx = GuestRegisters->Rcx;
+                VpData->PrivateDr3LastRdx = GuestRegisters->Rdx;
+                VpData->PrivateDr3LastR8 = GuestRegisters->R8;
+                VpData->PrivateDr3LastR9 = GuestRegisters->R9;
+                VpData->PrivateDr3LastRsp = VpData->GuestVmcb.StateSaveArea.Rsp;
+                VpData->PrivateDr3LastRflags = VpData->GuestVmcb.StateSaveArea.Rflags;
+                VpData->PrivateDr3LastRax = GuestRegisters->Rax;
+                VpData->PrivateDr3LastRbp = GuestRegisters->Rbp;
+                VpData->GuestVmcb.StateSaveArea.Dr7 =
+                    VpData->GuestShadowDr7 & ~0xF00000C0ULL;
+                VpData->PrivateDr3Target = 0;
+                VpData->PrivateDr3OneShot = FALSE;
+                if (VpData->PrivateDr3RedirectRip != 0)
+                    VpData->GuestVmcb.StateSaveArea.Rip = VpData->PrivateDr3RedirectRip;
+                VpData->PrivateDr3RedirectRip = 0;
+            }
+            InterlockedIncrement64(&VpData->PrivateDr3Hits);
+            VpData->GuestVmcb.StateSaveArea.Dr6 = debugStatus & ~8ULL;
+            VpData->GuestVmcb.StateSaveArea.Rflags |= 0x10000ULL;
+            if ((debugStatus & 0xE007) == 0)
+                break;
+        }
+        EVENTINJ event;
+        event.AsUInt64 = 0;
+        event.Fields.Vector = 1;
+        event.Fields.Type = 3;
+        event.Fields.Valid = 1;
+        VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+        break;
+    }
+    case VMEXIT_VMMCALL:
+    {
+        if (VpData->NestedActive)
+        {
+            SvInjectGeneralProtectionException(VpData);
+            break;
+        }
+
+        PSHARED_VIRTUAL_PROCESSOR_DATA shared = VpData->HostStackLayout.SharedVpData;
+        UINT64 rip = VpData->GuestVmcb.StateSaveArea.Rip;
+        UINT64 rsp = VpData->GuestVmcb.StateSaveArea.Rsp;
+        if (VpData->GuestVmcb.StateSaveArea.Cpl != 0 || !shared->KiGuestRegistered ||
+            InterlockedCompareExchange64(&shared->KiInFlight, 0, 0) <= 0)
+        {
+            SvInjectGeneralProtectionException(VpData);
+            break;
+        }
+        if (rip == shared->KiCaptureExit && !VpData->KiExitPending)
+        {
+            VpData->KiExitRax = GuestRegisters->Rax;
+            VpData->KiExitRflags = VpData->GuestVmcb.StateSaveArea.Rflags;
+            VpData->KiExitRsp = rsp;
+            VpData->KiExitPending = TRUE;
+            VpData->GuestVmcb.StateSaveArea.Rflags &= ~(0x200ULL | 0x100ULL);
+            VpData->GuestVmcb.StateSaveArea.Rip = rip + 3;
+        }
+        else if (rip == shared->KiCommitExit && VpData->KiExitPending &&
+            rsp == VpData->KiExitRsp + 8 &&
+            LmvKiExitTargetValid(GuestRegisters->Rax, shared->KiGuestBase, shared->KiGuestEnd))
+        {
+            VpData->GuestVmcb.StateSaveArea.Rip = GuestRegisters->Rax;
+            GuestRegisters->Rax = VpData->KiExitRax;
+            VpData->GuestVmcb.StateSaveArea.Rflags = VpData->KiExitRflags;
+            VpData->KiExitPending = FALSE;
+            InterlockedDecrement64(&shared->KiInFlight);
+        }
+        else if (rip == shared->KiPassExit)
+        {
+            VpData->GuestVmcb.StateSaveArea.Rip = shared->KiSessionEntry + 2;
+            InterlockedDecrement64(&shared->KiInFlight);
+        }
+        else
+            SvInjectGeneralProtectionException(VpData);
+        break;
+    }
+    case VMEXIT_CPUID:
+        SvHandleCpuid(VpData, &guestContext);
+        break;
+    case VMEXIT_MSR:
+        SvHandleMsrAccess(VpData, &guestContext);
+        break;
+    case VMEXIT_VMRUN:
+        SvHandleVmrun(VpData, &guestContext);
+        break;
+    case VMEXIT_VMLOAD:
+        SvHandleSvmStateInstruction(VpData, GuestRegisters, FALSE);
+        break;
+    case VMEXIT_VMSAVE:
+        SvHandleSvmStateInstruction(VpData, GuestRegisters, TRUE);
+        break;
+    case VMEXIT_STGI:
+    case VMEXIT_CLGI:
+    case VMEXIT_INVLPGA:
+        SvHandleSvmControlInstruction(VpData);
+        break;
+    case VMEXIT_SKINIT:
+        SvInjectGeneralProtectionException(VpData);
+        break;
+    case VMEXIT_NPF:
+        InterlockedIncrement64(&VpData->NpfCount);
+        InterlockedIncrement64(&VpData->HostStackLayout.SharedVpData->NpfTotal);
+        if (VpData->NestedActive)
+        {
+            if (SvHandleNptExecProbe(
+                    VpData->HostStackLayout.SharedVpData,
+                    VpData->GuestVmcb.ControlArea.ExitInfo2,
+                    VpData->GuestVmcb.ControlArea.ExitInfo1,
+                    &VpData->GuestVmcb.StateSaveArea.Rip))
+            {
+                VpData->GuestVmcb.ControlArea.TlbControl = 1;
+            }
+            else if (!SvHandleNptTestWriteFault(VpData))
+            {
+                SvAbortNestedGuest(VpData, GuestRegisters);
+            }
+            break;
+        }
+        SvDebugPrint("NPF: CPU=%hu:%hu GPA=%llx Info1=%llx Info2=%llx RIP=%llx\n",
+                     VpData->ProcessorGroup,
+                     VpData->ProcessorNumber,
+                     VpData->GuestVmcb.ControlArea.ExitInfo2,
+                     VpData->GuestVmcb.ControlArea.ExitInfo1,
+                     VpData->GuestVmcb.ControlArea.ExitInfo2,
+                     VpData->GuestVmcb.StateSaveArea.Rip);
+        if (SvHandleNptExecProbe(
+                VpData->HostStackLayout.SharedVpData,
+                VpData->GuestVmcb.ControlArea.ExitInfo2,
+                VpData->GuestVmcb.ControlArea.ExitInfo1,
+                &VpData->GuestVmcb.StateSaveArea.Rip))
+        {
+            VpData->GuestVmcb.ControlArea.TlbControl = 1;
+        }
+        else if (SvHandleNptTestWriteFault(VpData) == FALSE)
+        {
+            SV_DEBUG_BREAK();
+#pragma prefast(suppress : __WARNING_USE_OTHER_FUNCTION, "Unrecoverable NPF.")
+            KeBugCheck(MANUALLY_INITIATED_CRASH);
+        }
+        break;
+    default:
+        if (VpData->NestedActive &&
+            VpData->GuestVmcb.ControlArea.ExitCode >= VMEXIT_EXCEPTION_DE &&
+            VpData->GuestVmcb.ControlArea.ExitCode <= VMEXIT_EXCEPTION_31)
+        {
+            SvInjectNestedException(VpData);
+            break;
+        }
+        if (VpData->NestedActive)
+        {
+            SvInjectGeneralProtectionException(VpData);
+            break;
+        }
+        SV_DEBUG_BREAK();
+#pragma prefast(suppress : __WARNING_USE_OTHER_FUNCTION, "Unrecoverable path.")
+        KeBugCheck(MANUALLY_INITIATED_CRASH);
+    }
+
+
+    //
+    // Again, no effect to change IRQL but restoring it here since a #VMEXIT
+    // handler where the developers most likely call the kernel API inadvertently
+    // is already executed.
+    //
+VmExitHandled:
+    if (oldIrql < DISPATCH_LEVEL)
+    {
+        KeLowerIrql(oldIrql);
+    }
+
+    //
+    // Terminate the SimpleSvm hypervisor if requested.
+    //
+    if (guestContext.ExitVm != FALSE)
+    {
+        NT_ASSERT(VpData->GuestVmcb.ControlArea.ExitCode == VMEXIT_CPUID);
+
+        //
+        // Set return values of CPUID instruction as follows:
+        //  RBX     = An address to return
+        //  RCX     = A stack pointer to restore
+        //  EDX:EAX = An address of per processor data to be freed by the caller
+        //
+        guestContext.VpRegs->Rax = reinterpret_cast<UINT64>(VpData) & MAXUINT32;
+        guestContext.VpRegs->Rbx = guestContext.ResumeAtCurrentRip ?
+            VpData->GuestVmcb.StateSaveArea.Rip :
+            VpData->GuestVmcb.ControlArea.NRip;
+        guestContext.VpRegs->Rcx = VpData->GuestVmcb.StateSaveArea.Rsp;
+        guestContext.VpRegs->Rdx = reinterpret_cast<UINT64>(VpData) >> 32;
+
+        //
+        // Load guest state (currently host state is loaded).
+        //
+        __svm_vmload(MmGetPhysicalAddress(&VpData->GuestVmcb).QuadPart);
+
+        //
+        // Set the global interrupt flag (GIF) but still disable interrupts by
+        // clearing IF. GIF must be set to return to the normal execution, but
+        // interruptions are not desirable until SVM is disabled as it would
+        // execute random kernel-code in the host context.
+        //
+        _disable();
+        __writedr(2, VpData->GuestShadowDr2);
+        __writedr(3, VpData->GuestShadowDr3);
+        __writedr(7, VpData->GuestShadowDr7);
+        __svm_stgi();
+
+        //
+        // Disable SVM, and restore the guest RFLAGS. This may enable interrupts.
+        // Some of arithmetic flags are destroyed by the subsequent code.
+        //
+        __writemsr(IA32_MSR_EFER, __readmsr(IA32_MSR_EFER) & ~EFER_SVME);
+        __writeeflags(VpData->GuestVmcb.StateSaveArea.Rflags);
+        goto Exit;
+    }
+
+    //
+    // Reflect potentially updated guest's RAX to VMCB. Again, unlike other GPRs,
+    // RAX is loaded from VMCB on VMRUN.
+    //
+    VpData->GuestVmcb.StateSaveArea.Rax = guestContext.VpRegs->Rax;
+
+Exit:
+    NT_ASSERT(VpData->HostStackLayout.Reserved1 == MAXUINT64);
+    return guestContext.ExitVm;
+}
+
+/*!
+    @brief      Returns attributes of a segment specified by the segment selector.
+
+    @details    This function locates a segment descriptor from the segment
+                selector and the GDT base, extracts attributes of the segment,
+                and returns it. The returned value is the same as what the "dg"
+                command of Windbg shows as "Flags". Here is an example output
+                with 0x18 of the selector:
+                ----
+                0: kd> dg 18
+                P Si Gr Pr Lo
+                Sel        Base              Limit          Type    l ze an es ng Flags
+                ---- ----------------- ----------------- ---------- - -- -- -- -- --------
+                0018 00000000`00000000 00000000`00000000 Data RW Ac 0 Bg By P  Nl 00000493
+                ----
+
+    @param[in]  SegmentSelector - A segment selector to get attributes of a
+                corresponding descriptor.
+    @param[in]  GdtBase - A base address of GDT.
+
+    @result     Attributes of the segment.
+ */
+_IRQL_requires_same_
+_Check_return_
+static
+UINT16
+SvGetSegmentAccessRight (
+    _In_ UINT16 SegmentSelector,
+    _In_ ULONG_PTR GdtBase
+    )
+{
+    PSEGMENT_DESCRIPTOR descriptor;
+    SEGMENT_ATTRIBUTE attribute;
+
+    //
+    // Get a segment descriptor corresponds to the specified segment selector.
+    //
+    descriptor = reinterpret_cast<PSEGMENT_DESCRIPTOR>(
+                                        GdtBase + (SegmentSelector & ~RPL_MASK));
+
+    //
+    // Extract all attribute fields in the segment descriptor to a structure
+    // that describes only attributes (as opposed to the segment descriptor
+    // consists of multiple other fields).
+    //
+    attribute.Fields.Type = descriptor->Fields.Type;
+    attribute.Fields.System = descriptor->Fields.System;
+    attribute.Fields.Dpl = descriptor->Fields.Dpl;
+    attribute.Fields.Present = descriptor->Fields.Present;
+    attribute.Fields.Avl = descriptor->Fields.Avl;
+    attribute.Fields.LongMode = descriptor->Fields.LongMode;
+    attribute.Fields.DefaultBit = descriptor->Fields.DefaultBit;
+    attribute.Fields.Granularity = descriptor->Fields.Granularity;
+    attribute.Fields.Reserved1 = 0;
+
+    return attribute.AsUInt16;
+}
+
+/*!
+    @brief      Tests whether the SimpleSvm hypervisor is installed.
+
+    @details    This function checks a result of CPUID leaf 40000000h, which
+                should return a vendor name of the hypervisor if any of those
+                who implement the Microsoft Hypervisor interface is installed.
+                If the SimpleSvm hypervisor is installed, this should return
+                "SimpleSvm", and if no hypervisor is installed, it the result of
+                CPUID is undefined. For more details of the interface, see
+                "Requirements for implementing the Microsoft Hypervisor interface"
+                https://msdn.microsoft.com/en-us/library/windows/hardware/Dn613994(v=vs.85).aspx
+
+    @result     TRUE when the SimpleSvm is installed; otherwise, FALSE.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
+_IRQL_requires_same_
+_Check_return_
+static
+BOOLEAN
+SvIsSimpleSvmHypervisorInstalled (
+    VOID
+    )
+{
+    int registers[4];   // EAX, EBX, ECX, and EDX
+
+    //
+    // Use a covert communication channel via special CPUID leaf.
+    // Leaf 0x4C4D5654 ("LMVT") is used as a magic number for internal detection.
+    // If our hypervisor is installed, it will return 0x53564D4C ("SVML") in EAX.
+    //
+    const UINT32 LMVT_MAGIC_LEAF = 0x4C4D5654;      // "LMVT"
+    const UINT32 LMVT_MAGIC_RETURN = 0x53564D4C;   // "SVML"
+
+    __cpuidex(registers, LMVT_MAGIC_LEAF, 0);
+
+    return (registers[0] == LMVT_MAGIC_RETURN);
+}
+
+/*!
+    @brief      Virtualizes the current processor.
+
+    @details    This function enables SVM, initialize VMCB with the current
+                processor state, and enters the guest mode on the current
+                processor.
+
+    @param[in,out]  VpData - The address of per processor data.
+    @param[in]      SharedVpData - The address of share data.
+    @param[in]      ContextRecord - The address of CONETEXT to use as an initial
+                    context of the processor after it is virtualized.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
+_IRQL_requires_same_
+static
+VOID
+SvPrepareForVirtualization (
+    _Inout_ PVIRTUAL_PROCESSOR_DATA VpData,
+    _In_ PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData,
+    _In_ const CONTEXT* ContextRecord
+    )
+{
+    DESCRIPTOR_TABLE_REGISTER gdtr, idtr;
+    PHYSICAL_ADDRESS guestVmcbPa, hostVmcbPa, hostStateAreaPa, pml4BasePa, msrpmPa;
+
+    //
+    // Capture the current GDTR and IDTR to use as initial values of the guest
+    // mode.
+    //
+    _sgdt(&gdtr);
+    __sidt(&idtr);
+
+    guestVmcbPa = MmGetPhysicalAddress(&VpData->GuestVmcb);
+    hostVmcbPa = MmGetPhysicalAddress(&VpData->HostVmcb);
+    hostStateAreaPa = MmGetPhysicalAddress(&VpData->HostStateArea);
+    pml4BasePa = MmGetPhysicalAddress(&SharedVpData->Pml4Entries);
+    msrpmPa = MmGetPhysicalAddress(SharedVpData->MsrPermissionsMap);
+
+    //
+    // Configure to trigger #VMEXIT with CPUID and VMRUN instructions. CPUID is
+    // intercepted to present existence of the SimpleSvm hypervisor and provide
+    // an interface to ask it to unload itself.
+    //
+    // VMRUN is intercepted because it is required by the processor to enter the
+    // guest mode; otherwise, #VMEXIT occurs due to VMEXIT_INVALID when a
+    // processor attempts to enter the guest mode. See "Canonicalization and
+    // Consistency Checks" on "VMRUN Instruction".
+    //
+    VpData->GuestVmcb.ControlArea.InterceptException |= 1u << 0;
+    VpData->GuestVmcb.ControlArea.InterceptDrRead |= (1u << 2) | (1u << 3) | (1u << 7);
+    VpData->GuestVmcb.ControlArea.InterceptDrWrite |= (1u << 2) | (1u << 3) | (1u << 7);
+    VpData->GuestVmcb.ControlArea.InterceptException |= 1u << 1;
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 |=
+        SVM_INTERCEPT_MISC1_CPUID | SVM_INTERCEPT_MISC1_INVLPGA;
+    VpData->GuestVmcb.ControlArea.InterceptMisc2 |=
+        SVM_INTERCEPT_MISC2_VMRUN | SVM_INTERCEPT_MISC2_VMMCALL |
+        SVM_INTERCEPT_MISC2_VMLOAD | SVM_INTERCEPT_MISC2_VMSAVE |
+        SVM_INTERCEPT_MISC2_STGI | SVM_INTERCEPT_MISC2_CLGI |
+        SVM_INTERCEPT_MISC2_SKINIT;
+
+    //
+    // Also, configure to trigger #VMEXIT on MSR access as configured by the
+    // MSRPM. In our case, write to IA32_MSR_EFER is intercepted.
+    //
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_MSR_PROT;
+    VpData->GuestVmcb.ControlArea.MsrpmBasePa = msrpmPa.QuadPart;
+
+    //
+    // Specify guest's address space ID (ASID). TLB is maintained by the ID for
+    // guests. Use the same value for all processors since all of them run a
+    // single guest in our case. Use 1 as the most likely supported ASID by the
+    // processor. The actual the supported number of ASID can be obtained with
+    // CPUID. See "CPUID Fn8000_000A_EBX SVM Revision and Feature
+    // Identification". Zero of ASID is reserved and illegal.
+    //
+    VpData->GuestVmcb.ControlArea.GuestAsid = 1;
+
+    //
+    // Enable Nested Page Tables. By enabling this, the processor performs the
+    // nested page walk, that involves with an additional page walk to translate
+    // a guest physical address to a system physical address. An address of
+    // nested page tables is specified by the NCr3 field of VMCB.
+    //
+    // We have already build the nested page tables with SvBuildNestedPageTables.
+    //
+    // Note that our hypervisor does not trigger any additional #VMEXIT due to
+    // the use of Nested Page Tables since all physical addresses from 0-512 GB
+    // are configured to be accessible from the guest.
+    //
+    VpData->GuestVmcb.ControlArea.NpEnable |= SVM_NP_ENABLE_NP_ENABLE;
+    VpData->GuestVmcb.ControlArea.NCr3 = pml4BasePa.QuadPart;
+
+    //
+    // Set up the initial guest state based on the current system state. Those
+    // values are loaded into the processor as guest state when the VMRUN
+    // instruction is executed.
+    //
+    VpData->GuestVmcb.StateSaveArea.GdtrBase = gdtr.Base;
+    VpData->GuestVmcb.StateSaveArea.GdtrLimit = gdtr.Limit;
+    VpData->GuestVmcb.StateSaveArea.IdtrBase = idtr.Base;
+    VpData->GuestVmcb.StateSaveArea.IdtrLimit = idtr.Limit;
+
+    VpData->GuestVmcb.StateSaveArea.CsLimit = GetSegmentLimit(ContextRecord->SegCs);
+    VpData->GuestVmcb.StateSaveArea.DsLimit = GetSegmentLimit(ContextRecord->SegDs);
+    VpData->GuestVmcb.StateSaveArea.EsLimit = GetSegmentLimit(ContextRecord->SegEs);
+    VpData->GuestVmcb.StateSaveArea.SsLimit = GetSegmentLimit(ContextRecord->SegSs);
+    VpData->GuestVmcb.StateSaveArea.CsSelector = ContextRecord->SegCs;
+    VpData->GuestVmcb.StateSaveArea.DsSelector = ContextRecord->SegDs;
+    VpData->GuestVmcb.StateSaveArea.EsSelector = ContextRecord->SegEs;
+    VpData->GuestVmcb.StateSaveArea.SsSelector = ContextRecord->SegSs;
+    VpData->GuestVmcb.StateSaveArea.CsAttrib = SvGetSegmentAccessRight(ContextRecord->SegCs, gdtr.Base);
+    VpData->GuestVmcb.StateSaveArea.DsAttrib = SvGetSegmentAccessRight(ContextRecord->SegDs, gdtr.Base);
+    VpData->GuestVmcb.StateSaveArea.EsAttrib = SvGetSegmentAccessRight(ContextRecord->SegEs, gdtr.Base);
+    VpData->GuestVmcb.StateSaveArea.SsAttrib = SvGetSegmentAccessRight(ContextRecord->SegSs, gdtr.Base);
+
+    VpData->GuestVmcb.StateSaveArea.Efer = __readmsr(IA32_MSR_EFER);
+    VpData->NestedVirtualEfer = VpData->GuestVmcb.StateSaveArea.Efer & ~EFER_SVME;
+    VpData->NestedVirtualVmCr = __readmsr(SVM_MSR_VM_CR);
+    VpData->NestedVirtualVmHsavePa = 0;
+    VpData->NestedVirtualGif = TRUE;
+    VpData->GuestVmcb.StateSaveArea.Cr0 = __readcr0();
+    VpData->GuestVmcb.StateSaveArea.Cr2 = __readcr2();
+    VpData->GuestVmcb.StateSaveArea.Cr3 = __readcr3();
+    VpData->GuestVmcb.StateSaveArea.Cr4 = __readcr4();
+    VpData->GuestVmcb.StateSaveArea.Dr6 = __readdr(6);
+    VpData->GuestVmcb.StateSaveArea.Dr7 = __readdr(7);
+    VpData->OriginalHostDr2 = __readdr(2);
+    VpData->OriginalHostDr3 = __readdr(3);
+    VpData->OriginalHostDr7 = VpData->GuestVmcb.StateSaveArea.Dr7;
+    VpData->GuestShadowDr2 = VpData->OriginalHostDr2;
+    VpData->GuestShadowDr3 = VpData->OriginalHostDr3;
+    VpData->GuestShadowDr7 = VpData->OriginalHostDr7;
+    VpData->GuestVmcb.StateSaveArea.Dr7 &= ~0xF00000C0ULL;
+    VpData->GuestVmcb.StateSaveArea.Rflags = ContextRecord->EFlags;
+    VpData->GuestVmcb.StateSaveArea.Rsp = ContextRecord->Rsp;
+    VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
+    VpData->GuestVmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
+
+    //
+    // Save some of the current state on VMCB. Some of those states are:
+    // - FS, GS, TR, LDTR (including all hidden state)
+    // - KernelGsBase
+    // - STAR, LSTAR, CSTAR, SFMASK
+    // - SYSENTER_CS, SYSENTER_ESP, SYSENTER_EIP
+    // See "VMSAVE and VMLOAD Instructions" for mode details.
+    //
+    // Those are restored to the processor right before #VMEXIT with the VMLOAD
+    // instruction so that the guest can start its execution with saved state,
+    // and also, re-saved to the VMCS with right after #VMEXIT with the VMSAVE
+    // instruction so that the host (hypervisor) do not destroy guest's state.
+    //
+    // **Anti-detection safety**: Verify EFER.SVME before VMSAVE.
+    //
+    UINT64 eferBefore = __readmsr(IA32_MSR_EFER);
+    if ((eferBefore & EFER_SVME) == 0)
+    {
+        SvDebugPrint("[!!!] EFER.SVME was cleared! EFER=0x%llx. Re-enabling.\n", eferBefore);
+        __writemsr(IA32_MSR_EFER, eferBefore | EFER_SVME);
+    }
+    __svm_vmsave(guestVmcbPa.QuadPart);
+
+    //
+    // Store data to stack so that the host (hypervisor) can use those values.
+    //
+    VpData->HostStackLayout.Reserved1 = MAXUINT64;
+    VpData->HostStackLayout.SharedVpData = SharedVpData;
+    VpData->HostStackLayout.Self = VpData;
+    VpData->HostStackLayout.HostVmcbPa = hostVmcbPa.QuadPart;
+    VpData->HostStackLayout.GuestVmcbPa = guestVmcbPa.QuadPart;
+
+    //
+    // Set an address of the host state area to VM_HSAVE_PA MSR. The processor
+    // saves some of the current state on VMRUN and loads them on #VMEXIT. See
+    // "VM_HSAVE_PA MSR (C001_0117h)".
+    //
+    __writemsr(SVM_MSR_VM_HSAVE_PA, hostStateAreaPa.QuadPart);
+
+    //
+    // Also, save some of the current state to VMCB for the host. This is loaded
+    // after #VMEXIT to reproduce the current state for the host (hypervisor).
+    //
+    // **Anti-detection safety**: Re-verify EFER.SVME before second VMSAVE.
+    //
+    UINT64 eferBefore2 = __readmsr(IA32_MSR_EFER);
+    if ((eferBefore2 & EFER_SVME) == 0)
+    {
+        SvDebugPrint("[!!!] EFER.SVME was cleared before 2nd VMSAVE! EFER=0x%llx. Re-enabling.\n", eferBefore2);
+        __writemsr(IA32_MSR_EFER, eferBefore2 | EFER_SVME);
+    }
+    __svm_vmsave(hostVmcbPa.QuadPart);
+}
+
+/*!
+    @brief      Virtualize the current processor.
+
+    @details    This function enables SVM, initialize VMCB with the current
+                processor state, and enters the guest mode on the current
+                processor.
+
+    @param[in]  Context - A pointer of share data.
+
+    @result     STATUS_SUCCESS on success; otherwise, an appropriate error code.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
+_IRQL_requires_same_
+_Check_return_
+static
+NTSTATUS
+SvVirtualizeProcessor (
+    _In_opt_ PVOID Context
+    )
+{
+    NTSTATUS status;
+    PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData;
+    PVIRTUAL_PROCESSOR_DATA vpData;
+    PCONTEXT contextRecord;
+
+    SV_DEBUG_BREAK();
+
+    vpData = nullptr;
+
+    NT_ASSERT(ARGUMENT_PRESENT(Context));
+    _Analysis_assume_(ARGUMENT_PRESENT(Context));
+
+    contextRecord = static_cast<PCONTEXT>(ExAllocatePool2(
+                                                        POOL_FLAG_NON_PAGED,
+                                                        sizeof(*contextRecord),
+                                                        'MVSS'));
+    if (contextRecord == nullptr)
+    {
+        SvDebugPrint("Insufficient memory.\n");
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+
+    //
+    // Allocate per processor data.
+    //
+#pragma prefast(suppress : __WARNING_MEMORY_LEAK, "Ownership is taken on success.")
+    vpData = static_cast<PVIRTUAL_PROCESSOR_DATA>(
+            SvAllocatePageAlingedPhysicalMemory(sizeof(VIRTUAL_PROCESSOR_DATA)));
+    if (vpData == nullptr)
+    {
+        SvDebugPrint("Insufficient memory.\n");
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+
+    vpData->NestedMsrPermissionsMap = SvAllocateContiguousMemory(
+        SVM_MSR_PERMISSIONS_MAP_SIZE);
+    vpData->NestedL1MsrPermissionsMap = SvAllocateContiguousMemory(
+        SVM_MSR_PERMISSIONS_MAP_SIZE);
+    vpData->NestedIoPermissionsMap = SvAllocateContiguousMemory(
+        SVM_IO_PERMISSIONS_MAP_SIZE);
+    if (vpData->NestedMsrPermissionsMap == nullptr ||
+        vpData->NestedL1MsrPermissionsMap == nullptr ||
+        vpData->NestedIoPermissionsMap == nullptr)
+    {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+
+    status = SvInitializeNestedMemoryWindow(vpData);
+    if (!NT_SUCCESS(status))
+        goto Exit;
+    vpData->NestedMsrpmPa = MmGetPhysicalAddress(vpData->NestedMsrPermissionsMap).QuadPart;
+    vpData->NestedIopmPa = MmGetPhysicalAddress(vpData->NestedIoPermissionsMap).QuadPart;
+
+    //
+    // Capture the current RIP, RSP, RFLAGS, and segment selectors. This
+    // captured state is used as an initial state of the guest mode; therefore
+    // when virtualization starts by the later call of SvLaunchVm, a processor
+    // resume its execution at this location and state.
+    //
+    PROCESSOR_NUMBER processorNumber;
+    KeGetCurrentProcessorNumberEx(&processorNumber);
+    vpData->ProcessorGroup = processorNumber.Group;
+    vpData->ProcessorNumber = processorNumber.Number;
+    RtlCaptureContext(contextRecord);
+
+    //
+    // First time of this execution, the SimpleSvm hypervisor is not installed
+    // yet. Therefore, the branch is taken, and virtualization is attempted.
+    //
+    // At the second execution of here, after SvLaunchVm virtualized the
+    // processor, SvIsSimpleSvmHypervisorInstalled returns TRUE, and this
+    // function exits with STATUS_SUCCESS.
+    //
+    if (SvIsSimpleSvmHypervisorInstalled() == FALSE)
+    {
+        SvDebugPrint("Attempting to virtualize the processor.\n");
+        sharedVpData = static_cast<PSHARED_VIRTUAL_PROCESSOR_DATA>(Context);
+
+        //
+        // Enable SVM by setting EFER.SVME. It has already been verified that this
+        // bit was writable with SvIsSvmSupported.
+        //
+        UINT64 eferBefore = __readmsr(IA32_MSR_EFER);
+        __writemsr(IA32_MSR_EFER, eferBefore | EFER_SVME);
+        UINT64 eferAfter = __readmsr(IA32_MSR_EFER);
+        SvDebugPrint("[Init] Set EFER.SVME: before=0x%llx, after=0x%llx\n", eferBefore, eferAfter);
+
+        //
+        // Set up VMCB, the structure describes the guest state and what events
+        // within the guest should be intercepted, ie, triggers #VMEXIT.
+        //
+        SvPrepareForVirtualization(vpData, sharedVpData, contextRecord);
+
+        //
+        // Switch to the host RSP to run as the host (hypervisor), and then
+        // enters loop that executes code as a guest until #VMEXIT happens and
+        // handles #VMEXIT as the host.
+        //
+        // This function should never return to here.
+        //
+        SvLaunchVm(&vpData->HostStackLayout.GuestVmcbPa);
+        SV_DEBUG_BREAK();
+#pragma prefast(suppress : __WARNING_USE_OTHER_FUNCTION, "Unrecoverble path.")
+        KeBugCheck(MANUALLY_INITIATED_CRASH);
+    }
+
+    SvDebugPrint("The processor has been virtualized.\n");
+    status = STATUS_SUCCESS;
+
+Exit:
+    if (contextRecord != nullptr)
+    {
+        ExFreePoolWithTag(contextRecord, 'MVSS');
+    }
+    if ((!NT_SUCCESS(status)) && (vpData != nullptr))
+    {
+        //
+        // Frees per processor data if allocated and this function is
+        // unsuccessful.
+        //
+        if (vpData->NestedIoPermissionsMap != nullptr)
+            SvFreeContiguousMemory(vpData->NestedIoPermissionsMap);
+        SvReleaseNestedMemoryWindow(vpData);
+        if (vpData->NestedL1MsrPermissionsMap != nullptr)
+            SvFreeContiguousMemory(vpData->NestedL1MsrPermissionsMap);
+        if (vpData->NestedMsrPermissionsMap != nullptr)
+            SvFreeContiguousMemory(vpData->NestedMsrPermissionsMap);
+        SvFreePageAlingedPhysicalMemory(vpData);
+    }
+    return status;
+}
+
+/*!
+    @brief      Execute a callback on all processors one-by-one.
+
+    @details    This function execute Callback with Context as a parameter for
+                each processor on the current IRQL. If the callback returned
+                non-STATUS_SUCCESS value or any error occurred, this function
+                stops execution of the callback and returns the error code.
+
+                When NumOfProcessorCompleted is not NULL, this function always
+                set a number of processors that successfully executed the
+                callback.
+
+    @param[in]  Callback - A function to execute on all processors.
+    @param[in]  Context - A parameter to pass to the callback.
+    @param[out] NumOfProcessorCompleted - A pointer to receive a number of
+                processors executed the callback successfully.
+
+    @result     STATUS_SUCCESS when Callback executed and returned STATUS_SUCCESS
+                on all processors; otherwise, an appropriate error code.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
+_IRQL_requires_same_
+_Check_return_
+static
+NTSTATUS
+SvExecuteOnEachProcessor (
+    _In_ NTSTATUS (*Callback)(PVOID),
+    _In_opt_ PVOID Context,
+    _Out_opt_ PULONG NumOfProcessorCompleted
+    )
+{
+    NTSTATUS status;
+    ULONG i, numOfProcessors;
+    PROCESSOR_NUMBER processorNumber;
+    GROUP_AFFINITY affinity, oldAffinity;
+
+    status = STATUS_SUCCESS;
+
+    //
+    // Get a number of processors on this system.
+    //
+    numOfProcessors = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+
+    for (i = 0; i < numOfProcessors; i++)
+    {
+        //
+        // Convert from an index to a processor number.
+        //
+        status = KeGetProcessorNumberFromIndex(i, &processorNumber);
+        if (!NT_SUCCESS(status))
+        {
+            goto Exit;
+        }
+
+        //
+        // Switch execution of this code to a processor #i.
+        //
+        affinity.Group = processorNumber.Group;
+        affinity.Mask = 1ULL << processorNumber.Number;
+        affinity.Reserved[0] = affinity.Reserved[1] = affinity.Reserved[2] = 0;
+        KeSetSystemGroupAffinityThread(&affinity, &oldAffinity);
+
+        //
+        // Execute the callback.
+        //
+        status = Callback(Context);
+
+        //
+        // Revert the previously executed processor.
+        //
+        KeRevertToUserGroupAffinityThread(&oldAffinity);
+
+        //
+        // Exit if the callback returned error.
+        //
+        if (!NT_SUCCESS(status))
+        {
+            goto Exit;
+        }
+    }
+
+Exit:
+    //
+    // i must be the same as the number of processors on the system when this
+    // function returns STATUS_SUCCESS;
+    //
+    NT_ASSERT(!NT_SUCCESS(status) || (i == numOfProcessors));
+
+    //
+    // Set a number of processors that successfully executed callback if the
+    // out parameter is present.
+    //
+    if (ARGUMENT_PRESENT(NumOfProcessorCompleted))
+    {
+        *NumOfProcessorCompleted = i;
+    }
+    return status;
+}
+
+/*!
+    @brief      De-virtualize the current processor if virtualized.
+
+    @details    This function asks SimpleSVM hypervisor to deactivate itself
+                through CPUID with a back-door function id and frees per
+                processor data if it is returned. If the SimpleSvm is not
+                installed, this function does nothing.
+
+    @param[in]  Context - An out pointer to receive an address of shared data.
+
+    @result     Always STATUS_SUCCESS.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
+_IRQL_requires_same_
+_Check_return_
+static
+NTSTATUS
+SvDevirtualizeProcessor (
+    _In_opt_ PVOID Context
+    )
+{
+    int registers[4];   // EAX, EBX, ECX, and EDX
+    UINT64 high, low;
+    PVIRTUAL_PROCESSOR_DATA vpData;
+    PSHARED_VIRTUAL_PROCESSOR_DATA* sharedVpDataPtr;
+
+    if (!ARGUMENT_PRESENT(Context))
+    {
+        goto Exit;
+    }
+
+    //
+    // Ask SimpleSVM hypervisor to deactivate itself. If the hypervisor is
+    // installed, this ECX is set to 'SSVM', and EDX:EAX indicates an address
+    // of per processor data to be freed.
+    //
+    __cpuidex(registers, CPUID_UNLOAD_SIMPLE_SVM, CPUID_UNLOAD_SIMPLE_SVM);
+    if (registers[2] != 'SSVM')
+    {
+        goto Exit;
+    }
+
+    SvDebugPrint("The processor has been de-virtualized.\n");
+
+    //
+    // Get an address of per processor data indicated by EDX:EAX.
+    //
+    high = registers[3];
+    low = registers[0] & MAXUINT32;
+    vpData = reinterpret_cast<PVIRTUAL_PROCESSOR_DATA>(high << 32 | low);
+    NT_ASSERT(vpData->HostStackLayout.Reserved1 == MAXUINT64);
+    SvDebugPrint("CPU=%hu:%hu VMEXIT=%lld NPF=%lld\n",
+                 vpData->ProcessorGroup,
+                 vpData->ProcessorNumber,
+                 vpData->VmExitCount,
+                 vpData->NpfCount);
+
+    //
+    // Save an address of shared data, then free per processor data.
+    //
+    sharedVpDataPtr = static_cast<PSHARED_VIRTUAL_PROCESSOR_DATA*>(Context);
+    *sharedVpDataPtr = vpData->HostStackLayout.SharedVpData;
+    SvReleaseNestedMemoryWindow(vpData);
+    SvFreeContiguousMemory(vpData->NestedIoPermissionsMap);
+    SvFreeContiguousMemory(vpData->NestedL1MsrPermissionsMap);
+    SvFreeContiguousMemory(vpData->NestedMsrPermissionsMap);
+    SvFreePageAlingedPhysicalMemory(vpData);
+
+Exit:
+    return STATUS_SUCCESS;
+}
+
+/*!
+    @brief      De-virtualize all virtualized processors.
+
+    @details    This function execute a callback to de-virtualize a processor on
+                all processors, and frees shared data when the callback returned
+                its pointer from a hypervisor.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
+_IRQL_requires_same_
+static
+VOID
+SvDevirtualizeAllProcessors (
+    VOID
+    )
+{
+    PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData;
+
+    sharedVpData = nullptr;
+
+    //
+    // De-virtualize all processors and free shared data when returned.
+    //
+    NT_VERIFY(NT_SUCCESS(SvExecuteOnEachProcessor(SvDevirtualizeProcessor,
+                                                  &sharedVpData,
+                                                  nullptr)));
+    if (sharedVpData != nullptr)
+    {
+        SvFreeContiguousMemory(sharedVpData->MsrPermissionsMap);
+        SvFreePageAlingedPhysicalMemory(sharedVpData);
+    }
+}
+
+/*!
+    @brief          Build the MSR permissions map (MSRPM).
+
+    @details        This function sets up MSRPM to intercept to IA32_MSR_EFER,
+                    as suggested in "Extended Feature Enable Register (EFER)"
+                    ----
+                    Secure Virtual Machine Enable (SVME) Bit
+                    Bit 12, read/write. Enables the SVM extensions. (...) The
+                    effect of turning off EFER.SVME while a guest is running is
+                    undefined; therefore, the VMM should always prevent guests
+                    from writing EFER.
+                    ----
+
+                    Each MSR is controlled by two bits in the MSRPM. The LSB of
+                    the two bits controls read access to the MSR and the MSB
+                    controls write access. A value of 1 indicates that the
+                    operation is intercepted. This function locates an offset for
+                    IA32_MSR_EFER and sets the MSB bit. For details of logic, see
+                    "MSR Intercepts".
+
+    @param[in,out]  MsrPermissionsMap - The MSRPM to set up.
+ */
+_IRQL_requires_same_
+static
+VOID
+SvBuildMsrPermissionsMap (
+    _Inout_ PVOID MsrPermissionsMap
+    )
+{
+    RTL_BITMAP bitmapHeader;
+
+    RtlInitializeBitMap(&bitmapHeader,
+                        static_cast<PULONG>(MsrPermissionsMap),
+                        SVM_MSR_PERMISSIONS_MAP_SIZE * CHAR_BIT);
+    RtlClearAllBits(&bitmapHeader);
+
+    SvSetMsrPermissions(static_cast<UCHAR*>(MsrPermissionsMap),
+                        IA32_MSR_EFER, TRUE, TRUE);
+    SvSetMsrPermissions(static_cast<UCHAR*>(MsrPermissionsMap),
+                        SVM_MSR_VM_CR, TRUE, TRUE);
+    SvSetMsrPermissions(static_cast<UCHAR*>(MsrPermissionsMap),
+                        SVM_MSR_VM_HSAVE_PA, TRUE, TRUE);
+}
+
+/*!
+    @brief      Build pass-through style page tables used in nested paging.
+
+    @details    This function build page tables used in Nested Page Tables. The
+                page tables are used to translate from a guest physical address
+                to a system physical address and pointed by the NCr3 field of
+                VMCB, like the traditional page tables are pointed by CR3.
+
+                The nested page tables built in this function are set to
+                translate a guest physical address to the same system physical
+                address. For example, guest physical address 0x1000 is
+                translated into system physical address 0x1000.
+
+                In order to save memory to build nested page tables, 2MB large
+                pages are used (as opposed to the standard pages that describe
+                translation only for 4K granularity. Also, only up to 1 TB of
+                translation is built. 1GB huge pages are not used due to VMware
+                not supporting this feature.
+
+    @param[out] SharedVpData - Out buffer to build nested page tables.
+ */
+_IRQL_requires_same_
+static
+VOID
+SvBuildNestedPageTables (
+    _Out_ PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData
+    )
+{
+    ULONG64 pdptBasePa, pdBasePa, translationPa;
+
+    //
+    // Build only two PML4 entries. Those entries have subtables that control up to
+    // 1 TB physical memory. PFN points to a base physical address of the page
+    // directory pointer table.
+    //
+    for (ULONG64 pml4Index = 0; pml4Index < 2; pml4Index++) {
+        PPML4_ENTRY_2MB pml4e = &SharedVpData->Pml4Entries[pml4Index];
+        PPML4E_TREE pml4eTree = &SharedVpData->Pml4eTrees[pml4Index];
+
+        //
+        // Set the US (User) bit of all nested page table entries to be translated
+        // without #VMEXIT, as all guest accesses are treated as user accesses at
+        // the nested level. Also, the RW (Write) bit of nested page table entries
+        // that corresponds to guest page tables must be 1 since all guest page
+        // table accesses are threated as write access. See "Nested versus Guest
+        // Page Faults, Fault Ordering" for more details.
+        //
+        // Those settings do not lower security since permission checks are done
+        // twice independently: based on guest page tables, and nested page tables.
+        // See "Nested versus Guest Page Faults, Fault Ordering" for more details.
+        //
+        pdptBasePa = MmGetPhysicalAddress(&pml4eTree->PdptEntries).QuadPart;
+        pml4e->Fields.PageFrameNumber = pdptBasePa >> PAGE_SHIFT;
+        pml4e->Fields.Valid = 1;
+        pml4e->Fields.Write = 1;
+        pml4e->Fields.User = 1;
+
+        //
+        // One PML4 entry controls 512 page directory pointer entires.
+        //
+        for (ULONG64 pdptIndex = 0; pdptIndex < 512; pdptIndex++)
+        {
+            //
+            // PFN points to a base physical address of the page directory table.
+            //
+            pdBasePa = MmGetPhysicalAddress(&pml4eTree->PdEntries[pdptIndex][0]).QuadPart;
+            pml4eTree->PdptEntries[pdptIndex].Fields.PageFrameNumber = pdBasePa >> PAGE_SHIFT;
+            pml4eTree->PdptEntries[pdptIndex].Fields.Valid = 1;
+            pml4eTree->PdptEntries[pdptIndex].Fields.Write = 1;
+            pml4eTree->PdptEntries[pdptIndex].Fields.User = 1;
+
+            //
+            // One page directory entry controls 512 page directory entries.
+            //
+            // We do not explicitly configure PAT in the NPT entry. The consequences
+            // of this are: 1) pages whose PAT (Page Attribute Table) type is the
+            // Write-Combining (WC) memory type could be treated as the
+            // Write-Combining Plus (WC+) while it should be WC when the MTRR type is
+            // either Write Protect (WP), Writethrough (WT) or Writeback (WB), and
+            // 2) pages whose PAT type is Uncacheable Minus (UC-) could be treated
+            // as Cache Disabled (CD) while it should be WC, when MTRR type is WC.
+            //
+            // While those are not desirable, this is acceptable given that 1) only
+            // introduces additional cache snooping and associated performance
+            // penalty, which would not be significant since WC+ still lets
+            // processors combine multiple writes into one and avoid large
+            // performance penalty due to frequent writes to memory without caching.
+            // 2) might be worse but I have not seen MTRR ranges configured as WC
+            // on testing, hence the unintentional UC- will just results in the same
+            // effective memory type as what would be with UC.
+            //
+            // See "Memory Types" (7.4), for details of memory types,
+            // "PAT-Register PA-Field Indexing", "Combining Guest and Host PAT Types",
+            // and "Combining PAT and MTRR Types" for how the effective memory type
+            // is determined based on Guest PAT type, Host PAT type, and the MTRR
+            // type.
+            //
+            // The correct approach may be to look up the guest PTE and copy the
+            // caching related bits (PAT, PCD, and PWT) when constructing NTP
+            // entries for non RAM regions, so the combined PAT will always be the
+            // same as the guest PAT type. This may be done when any issue manifests
+            // with the current implementation.
+            //
+            for (ULONG64 pdIndex = 0; pdIndex < 512; pdIndex++)
+            {
+                //
+                // PFN points to a base physical address of system physical address
+                // to be translated from a guest physical address. Set the PS
+                // (LargePage) bit to indicate that this is a large page and no
+                // subtable exists.
+                //
+                translationPa = (pml4Index * 512 * 512) + (pdptIndex * 512) + pdIndex;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.PageFrameNumber = translationPa;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.Valid = 1;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.Write = 1;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.User = 1;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.LargePage = 1;
+            }
+        }
+    }
+}
+
+/*!
+    @brief      Test whether the current processor support the SVM feature.
+
+    @details    This function tests whether the current processor has enough
+                features to run SimpleSvm, especially about SVM features.
+
+    @result     TRUE if the processor supports the SVM feature; otherwise, FALSE.
+ */
+_IRQL_requires_same_
+_Check_return_
+static
+BOOLEAN
+SvIsSvmSupported (
+    VOID
+    )
+{
+    BOOLEAN svmSupported;
+    int registers[4];   // EAX, EBX, ECX, and EDX
+    ULONG64 vmcr;
+
+    svmSupported = FALSE;
+
+    //
+    // Test if the current processor is AMD one. An AMD processor should return
+    // "AuthenticAMD" from CPUID function 0. See "Function 0h-Maximum Standard
+    // Function Number and Vendor String".
+    //
+    __cpuid(registers, CPUID_MAX_STANDARD_FN_NUMBER_AND_VENDOR_STRING);
+    if ((registers[1] != 'htuA') ||
+        (registers[3] != 'itne') ||
+        (registers[2] != 'DMAc'))
+    {
+        goto Exit;
+    }
+
+    //
+    // Test if the SVM feature is supported by the current processor. See
+    // "Enabling SVM" and "CPUID Fn8000_0001_ECX Feature Identifiers".
+    //
+    __cpuid(registers, CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS_EX);
+    if ((registers[2] & CPUID_FN8000_0001_ECX_SVM) == 0)
+    {
+        goto Exit;
+    }
+
+    //
+    // Test if the Nested Page Tables feature is supported by the current
+    // processor. See "Enabling Nested Paging" and "CPUID Fn8000_000A_EDX SVM
+    // Feature Identification".
+    //
+    __cpuid(registers, CPUID_SVM_FEATURES);
+    if ((registers[3] & (CPUID_FN8000_000A_EDX_NP |
+                         CPUID_FN8000_000A_EDX_DECODE_ASSISTS)) !=
+        (CPUID_FN8000_000A_EDX_NP | CPUID_FN8000_000A_EDX_DECODE_ASSISTS))
+    {
+        goto Exit;
+    }
+
+    //
+    // Test if the SVM feature can be enabled. When VM_CR.SVMDIS is set,
+    // EFER.SVME cannot be 1; therefore, SVM cannot be enabled. When
+    // VM_CR.SVMDIS is clear, EFER.SVME can be written normally and SVM can be
+    // enabled. See "Enabling SVM".
+    //
+    vmcr = __readmsr(SVM_MSR_VM_CR);
+    if ((vmcr & SVM_VM_CR_SVMDIS) != 0)
+    {
+        goto Exit;
+    }
+
+    svmSupported = TRUE;
+
+Exit:
+    return svmSupported;
+}
+
+/*!
+    @brief      Virtualizes all processors on the system.
+
+    @details    This function attempts to virtualize all processors on the
+                system, and returns STATUS_SUCCESS if all processors are
+                successfully virtualized. If any processor is not virtualized,
+                this function de-virtualizes all processors and returns an error
+                code.
+
+    @result     STATUS_SUCCESS on success; otherwise, an appropriate error code.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
+_IRQL_requires_same_
+_Check_return_
+static
+NTSTATUS
+SvVirtualizeAllProcessors (
+    VOID
+    )
+{
+    NTSTATUS status;
+    PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData;
+    ULONG numOfProcessorsCompleted;
+
+    sharedVpData = nullptr;
+    numOfProcessorsCompleted = 0;
+
+    //
+    // Test whether the current processor supports all required SVM features. If
+    // not, exit as error.
+    //
+    if (SvIsSvmSupported() == FALSE)
+    {
+        SvDebugPrint("SVM is not fully supported on this processor.\n");
+        status = STATUS_HV_FEATURE_UNAVAILABLE;
+        goto Exit;
+    }
+
+    //
+    // Allocate a data structure shared across all processors. This data is
+    // page tables used for Nested Page Tables.
+    //
+#pragma prefast(suppress : __WARNING_MEMORY_LEAK, "Ownership is taken on success.")
+    sharedVpData = static_cast<PSHARED_VIRTUAL_PROCESSOR_DATA>(
+        SvAllocatePageAlingedPhysicalMemory(sizeof(SHARED_VIRTUAL_PROCESSOR_DATA)));
+    if (sharedVpData == nullptr)
+    {
+        SvDebugPrint("Insufficient memory.\n");
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+
+    sharedVpData->SharedPage.Magic = LMV_SHARED_PAGE_MAGIC;
+    sharedVpData->SharedPage.Version = LMV_CPUID_PROTOCOL_VERSION;
+    sharedVpData->SharedPage.Size = sizeof(LMV_SHARED_PAGE);
+    sharedVpData->SharedPage.State = LMV_SHARED_STATE_FREE;
+    sharedVpData->VmExitTotal = 0;
+    sharedVpData->NpfTotal = 0;
+    sharedVpData->ProcessorCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+
+    for (ULONG index = 0; index < RTL_NUMBER_OF(sharedVpData->NptTestRegions); ++index)
+    {
+        PNPT_TEST_REGION region = &sharedVpData->NptTestRegions[index];
+        region->PtesPhysicalAddress = MmGetPhysicalAddress(&region->Ptes[0]).QuadPart;
+        if (region->PtesPhysicalAddress == 0 ||
+            (region->PtesPhysicalAddress & (PAGE_SIZE - 1)) != 0)
+        {
+            status = STATUS_INVALID_ADDRESS;
+            goto Exit;
+        }
+    }
+    sharedVpData->DebugRegion.PtesPhysicalAddress =
+        MmGetPhysicalAddress(&sharedVpData->DebugRegion.Ptes[0]).QuadPart;
+    sharedVpData->DebugHook.ShadowHostPhysicalAddress =
+        MmGetPhysicalAddress(&sharedVpData->DebugHook.ShadowPage[0]).QuadPart;
+    if (sharedVpData->DebugRegion.PtesPhysicalAddress == 0 ||
+        (sharedVpData->DebugRegion.PtesPhysicalAddress & (PAGE_SIZE - 1)) != 0 ||
+        sharedVpData->DebugHook.ShadowHostPhysicalAddress == 0 ||
+        (sharedVpData->DebugHook.ShadowHostPhysicalAddress & (PAGE_SIZE - 1)) != 0)
+    {
+        status = STATUS_INVALID_ADDRESS;
+        goto Exit;
+    }
+    for (ULONG index = 0; index < RTL_NUMBER_OF(sharedVpData->NptTestPages); ++index)
+    {
+        PNPT_TEST_PAGE page = &sharedVpData->NptTestPages[index];
+        page->BackingPhysicalAddress = MmGetPhysicalAddress(&page->BackingPage[0]).QuadPart;
+        if (page->BackingPhysicalAddress == 0 ||
+            (page->BackingPhysicalAddress & (PAGE_SIZE - 1)) != 0)
+        {
+            status = STATUS_INVALID_ADDRESS;
+            goto Exit;
+        }
+    }
+
+    //
+    // Allocate MSR permissions map (MSRPM) onto contiguous physical memory.
+    //
+    sharedVpData->MsrPermissionsMap = SvAllocateContiguousMemory(
+                                                    SVM_MSR_PERMISSIONS_MAP_SIZE);
+    if (sharedVpData->MsrPermissionsMap == nullptr)
+    {
+        SvDebugPrint("Insufficient memory.\n");
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+
+    //
+    // Build nested page table and MSRPM.
+    //
+    SvBuildNestedPageTables(sharedVpData);
+    SvBuildMsrPermissionsMap(sharedVpData->MsrPermissionsMap);
+
+    //
+    // Execute SvVirtualizeProcessor on and virtualize each processor one-by-one.
+    // How many processors were successfully virtualized is stored in the third
+    // parameter.
+    //
+    // STATUS_SUCCESS is returned if all processor are successfully virtualized.
+    // When any error occurs while virtualizing processors, this function does
+    // not attempt to virtualize the rest of processor. Therefore, only part of
+    // processors on the system may have been virtualized on error. In this case,
+    // it is a caller's responsibility to clean-up (de-virtualize) such
+    // processors.
+    //
+    status = SvExecuteOnEachProcessor(SvVirtualizeProcessor,
+                                      sharedVpData,
+                                      &numOfProcessorsCompleted);
+
+Exit:
+    if (!NT_SUCCESS(status))
+    {
+        //
+        // On failure, after successful allocation of shared data.
+        //
+        if (numOfProcessorsCompleted != 0)
+        {
+            //
+            // If one or more processors have already been virtualized,
+            // de-virtualize any of those processors, and free shared data.
+            //
+            NT_ASSERT(sharedVpData != nullptr);
+            SvDevirtualizeAllProcessors();
+        }
+        else
+        {
+            //
+            // If none of processors has not been virtualized, simply free
+            // shared data.
+            //
+            if (sharedVpData != nullptr)
+            {
+                if (sharedVpData->MsrPermissionsMap != nullptr)
+                {
+                    SvFreeContiguousMemory(sharedVpData->MsrPermissionsMap);
+                }
+                SvFreePageAlingedPhysicalMemory(sharedVpData);
+            }
+        }
+    }
+    return status;
+}
+
+/*!
+    @brief      An entry point of this driver.
+
+    @param[in]  DriverObject - A driver object.
+    @param[in]  RegistryPath - Unused.
+
+    @result     STATUS_SUCCESS on success; otherwise, an appropriate error code.
+ */
+_Use_decl_annotations_
+EXTERN_C
+NTSTATUS
+DriverEntry (
+    PDRIVER_OBJECT DriverObject,
+    PUNICODE_STRING RegistryPath
+    )
+{
+    NTSTATUS status;
+    UNICODE_STRING objectName;
+    OBJECT_ATTRIBUTES objectAttributes;
+    PCALLBACK_OBJECT callbackObject;
+    PVOID callbackRegistration;
+
+    UNREFERENCED_PARAMETER(RegistryPath);
+
+    SV_DEBUG_BREAK();
+
+    callbackRegistration = nullptr;
+    DriverObject->DriverUnload = SvDriverUnload;
+    g_HostDriverObject = DriverObject;
+
+    //
+    // Opts-in no-execute (NX) nonpaged pool when available for security. By
+    // defining POOL_NX_OPTIN as 1 and calling this function, nonpaged pool
+    // allocation by the ExAllocatePool family with the NonPagedPool flag
+    // automatically allocates NX nonpaged pool on Windows 8 and later versions
+    // of Windows, while on Windows 7 where NX nonpaged pool is unsupported,
+    // executable nonpaged pool is returned as usual.
+    //
+    ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
+
+    status = LmvCreateControlDevice(DriverObject);
+    if (!NT_SUCCESS(status))
+    {
+        goto Exit;
+    }
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = LmvCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = LmvCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = LmvDeviceControl;
+
+    //
+    // Registers a power state callback (SvPowerCallbackRoutine) to handle
+    // system sleep and resume to manage virtualization state.
+    //
+    // First, opens the \Callback\PowerState callback object provides
+    // notification regarding power state changes. This is a system defined
+    // callback object that was already created by Windows. To open a system
+    // defined callback object, the Create parameter of ExCreateCallback must be
+    // FALSE (and AllowMultipleCallbacks is ignore when the Create parameter is
+    // FALSE).
+    //
+    objectName = RTL_CONSTANT_STRING(L"\\Callback\\PowerState");
+    objectAttributes = RTL_CONSTANT_OBJECT_ATTRIBUTES(&objectName,
+                                                      OBJ_CASE_INSENSITIVE);
+    status = ExCreateCallback(&callbackObject, &objectAttributes, FALSE, TRUE);
+    if (!NT_SUCCESS(status))
+    {
+        SvDebugPrint("Failed to open the power state callback object.\n");
+        goto Exit;
+    }
+
+    //
+    // Then, registers our callback. The open callback object must be
+    // dereferenced.
+    //
+    callbackRegistration = ExRegisterCallback(callbackObject,
+                                              SvPowerCallbackRoutine,
+                                              nullptr);
+    ObDereferenceObject(callbackObject);
+    if (callbackRegistration == nullptr)
+    {
+        SvDebugPrint("Failed to register a power state callback.\n");
+        status = STATUS_UNSUCCESSFUL;
+        goto Exit;
+    }
+
+    //
+    // Virtualize all processors on the system.
+    //
+    status = SvVirtualizeAllProcessors();
+
+Exit:
+    if (NT_SUCCESS(status))
+    {
+        //
+        // On success, save the registration handle for un-registration.
+        //
+        NT_ASSERT(callbackRegistration);
+        g_PowerCallbackRegistration = callbackRegistration;
+    }
+    else
+    {
+        //
+        // On any failure, clean up stuff as needed.
+        //
+        if (callbackRegistration != nullptr)
+        {
+            ExUnregisterCallback(callbackRegistration);
+        }
+        LmvDeleteControlDevice();
+    }
+    return status;
+}
+
+/*!
+    @brief      Driver unload callback.
+
+    @details    This function de-virtualize all processors on the system.
+
+    @param[in]  DriverObject - Unused.
+ */
+_Use_decl_annotations_
+static
+VOID
+SvDriverUnload (
+    PDRIVER_OBJECT DriverObject
+    )
+{
+    UNREFERENCED_PARAMETER(DriverObject);
+
+    SV_DEBUG_BREAK();
+
+    //
+    // Unregister the power state callback.
+    //
+    NT_ASSERT(g_PowerCallbackRegistration);
+    ExUnregisterCallback(g_PowerCallbackRegistration);
+
+    //
+    // De-virtualize all processors on the system.
+    //
+    SvDevirtualizeAllProcessors();
+    LmvDeleteControlDevice();
+}
+
+/*!
+    @brief      PowerState callback routine.
+
+    @details    This function de-virtualize all processors when the system is
+                exiting system power state S0 (ie, the system is about to sleep
+                etc), and virtualize all processors when the system has just
+                reentered S0 (ie, the system has resume from sleep etc).
+
+                Those operations are required because virtualization is cleared
+                during sleep.
+
+                For the meanings of parameters, see ExRegisterCallback in MSDN.
+
+    @param[in]  CallbackContext - Unused.
+    @param[in]  Argument1 - A PO_CB_XXX constant value.
+    @param[in]  Argument2 - A value of TRUE or FALSE.
+ */
+_Use_decl_annotations_
+static
+VOID
+SvPowerCallbackRoutine (
+    PVOID CallbackContext,
+    PVOID Argument1,
+    PVOID Argument2
+    )
+{
+    UNREFERENCED_PARAMETER(CallbackContext);
+
+    //
+    // PO_CB_SYSTEM_STATE_LOCK of Argument1 indicates that a system power state
+    // change is imminent.
+    //
+    if (Argument1 != reinterpret_cast<PVOID>(PO_CB_SYSTEM_STATE_LOCK))
+    {
+        goto Exit;
+    }
+
+    if (Argument2 != FALSE)
+    {
+        //
+        // The system has just reentered S0. Re-virtualize all processors.
+        //
+        NT_VERIFY(NT_SUCCESS(SvVirtualizeAllProcessors()));
+    }
+    else
+    {
+        //
+        // The system is about to exit system power state S0. De-virtualize all
+        // processors.
+        //
+        SvDevirtualizeAllProcessors();
+    }
+
+Exit:
+    return;
+}

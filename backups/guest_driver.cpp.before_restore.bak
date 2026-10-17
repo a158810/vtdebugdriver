@@ -1,0 +1,693 @@
+﻿#include <ntifs.h>
+#include <intrin.h>
+#include "../lmv_control_shared.h"
+#include "../ki_session_lifecycle.hpp"
+#include "guest_memory.hpp"
+#include "guest_layout.hpp"
+#include "static_probe_sample.hpp"
+extern "C" NTSTATUS LmvGuestFindKiFunctionBounds(
+    PLMV_GUEST_KI_PAGE_PREFLIGHT Output);
+
+extern "C" VOID LmvGuestCpuidCall(ULONG CommandId, ULONG Sequence, PLMV_CPUID_RESULT Result);
+extern "C" VOID LmvGuestQuerySharedPage(PLMV_CPUID_SHARED_PAGE_RESULT Result);
+extern "C" VOID LmvGuestKiDr3RedirectStub();
+extern "C" VOID LmvGuestKiDr3InspectStub();
+extern "C" VOID LmvGuestKiSessionEventStub();
+extern "C" VOID LmvGuestKiSessionPassStub();
+extern "C" VOID LmvGuestKiCaptureExit();
+extern "C" VOID LmvGuestKiCommitExit();
+
+// Forward declarations for missing functions
+static NTSTATUS LmvGuestStopKiSession(_Inout_ PLMV_GUEST_KI_SESSION Session);
+static NTSTATUS LmvGuestRunExecProbe(_Inout_ PLMV_GUEST_EXEC_PROBE Probe, _In_ BOOLEAN FromCleanup);
+static VOID LmvGuestStubReset();
+static VOID LmvGuestReleaseMirrorStorage();
+static VOID LmvGuestKiDr3CancelEvents(_In_opt_ PFILE_OBJECT FileObject);
+static NTSTATUS LmvGuestCleanupKernelProbe(_In_opt_ PFILE_OBJECT Owner);
+static NTSTATUS LmvGuestCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
+static NTSTATUS LmvGuestDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
+static VOID LmvGuestUnload(PDRIVER_OBJECT DriverObject);
+
+typedef struct _LMV_KI_INSPECT_STATE
+{
+    volatile LONG Valid;
+    ULONG Status;
+    ULONG Reason;
+    ULONG ProcessId;
+    ULONG ThreadId;
+    ULONG ExceptionCode;
+    ULONG FirstChance;
+    ULONGLONG ExceptionAddress;
+    ULONG FrameStatus;
+    ULONG FrameReason;
+    LMV_GUEST_KI_FRAME_SNAPSHOT Frame;
+    ULONG EventStatus;
+    ULONG EventSequence;
+} LMV_KI_INSPECT_STATE;
+
+static volatile LONG g_KiInspectEnabled;
+static volatile LONG g_KiInspectCaptureFrame;
+static volatile LONG g_KiDr3WaitEnabled;
+static volatile LONG g_KiDr3RaxWriteEnabled;
+static volatile LONG g_KiDr3HandleEnabled;
+static ULONG g_KiInspectTargetProcessId;
+static LMV_KI_INSPECT_STATE g_KiInspectState;
+static FAST_MUTEX g_KiDr3EventMutex;
+static KEVENT g_KiDr3EventAvailable;
+static constexpr ULONG kKiDr3EventCapacity = 16;
+static constexpr ULONG kKiDr3EventCancelled = 3;
+typedef struct _LMV_KI_DR3_EVENT_SLOT
+{
+    KEVENT Completed;
+    LMV_GUEST_KI_DR3_EVENT Event;
+    PFILE_OBJECT Consumer;
+    BOOLEAN RealFrame;
+    BOOLEAN WriteRax;
+    BOOLEAN Handled;
+    BOOLEAN WriteRip;
+    BOOLEAN WriteContext;
+    BOOLEAN Persistent;
+    ULONG State;
+} LMV_KI_DR3_EVENT_SLOT;
+static LMV_KI_DR3_EVENT_SLOT g_KiDr3Events[kKiDr3EventCapacity];
+static volatile LONG g_KiDr3EventSequence;
+static PFILE_OBJECT g_KiDr3EventOwner;
+static ULONG g_KiDr3ControllerProcessId;
+static ULONG g_KiDr3EventGeneration;
+static BOOLEAN g_KiDr3QueueSmokeActive;
+extern "C" volatile LONG64 g_LmvGuestKiDr3StubHits = 0;
+extern "C" volatile ULONGLONG g_LmvGuestKiDr3ReturnRip = 0;
+extern "C" volatile ULONGLONG g_LmvGuestKiSessionResumeRip = 0;
+static PDRIVER_OBJECT g_GuestDriverObject;
+static PEPROCESS g_KiSessionProcess;
+static PFILE_OBJECT g_KiSessionOwner;
+static volatile ULONG g_KiSessionMode = LMV_DEBUG_MODE_INTERACTIVE;  // Current debug mode
+static volatile LONG g_KiSessionActive;
+static KEVENT g_KiSessionGate;
+static BOOLEAN g_KiGuestRegistered;
+static BOOLEAN g_KiGuestRetired;
+static volatile LONG g_KiUnloadPreparing;
+static volatile LONG g_KiPersistentOnly;
+static LONG g_KiActiveRequests;
+
+static PDEVICE_OBJECT g_DeviceObject;
+static UNICODE_STRING g_SymbolicLink;
+static UNICODE_STRING g_DebugSymbolicLink;
+static FAST_MUTEX g_CommandMutex;
+static FAST_MUTEX g_SmokeMutex;
+static FAST_MUTEX g_KiSiteMutex;
+static PVOID g_KiNxSiteBuffer;
+static FAST_MUTEX g_KiMirrorMutex;
+static PVOID g_KiMirrorAllocation;
+static PMDL g_KiMirrorMdl;
+static PVOID g_KiMirrorPages;
+static PFILE_OBJECT g_KiMirrorOwner;
+static volatile LONG g_Sequence;
+static PMDL g_ExecProbeMdl;
+static ULONG g_ExecProbeProcessId;
+static ULONG g_ExecProbeStage;
+static ULONG g_KernelProbeStage;
+static ULONG g_KernelProbeProcessId;
+static PFILE_OBJECT g_ExecProbeFileObject;
+static FAST_MUTEX g_StubMutex;
+static KEVENT g_StubEventAvailable;
+static LMV_GUEST_STUB_EVENT g_StubQueue[LMV_GUEST_STUB_QUEUE_CAPACITY];
+static ULONG g_StubQueueHead;
+static ULONG g_StubQueueTail;
+static ULONG g_StubQueueCount;
+static LMV_GUEST_STUB_EVENT g_StubActiveEvent;
+static BOOLEAN g_StubActive;
+static volatile ULONG g_StubSequence;
+// δʹ�õĺ�������ע��
+/*
+static NTSTATUS
+LmvGuestIssueSharedCommand(
+    _In_ ULONG CommandId,
+    _In_ ULONGLONG GuestPhysicalAddress,
+    _Out_ PLMV_SHARED_RESULT Result,
+    _In_ ULONGLONG ExtraArgument = 0,
+    _In_ ULONGLONG Argument2 = 0,
+    _In_ ULONGLONG Argument3 = 0
+    )
+{
+    UNREFERENCED_PARAMETER(CommandId);
+    UNREFERENCED_PARAMETER(GuestPhysicalAddress);
+    UNREFERENCED_PARAMETER(ExtraArgument);
+    UNREFERENCED_PARAMETER(Argument2);
+    UNREFERENCED_PARAMETER(Argument3);
+    LMV_CPUID_SHARED_PAGE_RESULT pageResult = {};
+    LMV_CPUID_RESULT notifyResult = {};
+    PHYSICAL_ADDRESS pagePa = {};
+    // PLMV_SHARED_PAGE page = nullptr; // δʹ��
+    NTSTATUS status = STATUS_DEVICE_NOT_READY;
+    // ULONG sequence = static_cast<ULONG>(InterlockedIncrement(&g_Sequence)); // δʹ��
+
+    RtlZeroMemory(Result, sizeof(*Result));
+    ExAcquireFastMutex(&g_CommandMutex);
+    LmvGuestQuerySharedPage(&pageResult);
+    if (pageResult.Status != LMV_CPUID_RESULT_SUCCESS ||
+        pageResult.Magic != LMV_SHARED_PAGE_MAGIC)
+    {
+        goto Exit;
+    }
+
+
+Exit:
+    ExReleaseFastMutex(&g_CommandMutex);
+    ExAcquireFastMutex(&g_KiDr3EventMutex);
+    --g_KiActiveRequests;
+    ExReleaseFastMutex(&g_KiDr3EventMutex);
+    return status;
+}
+*/
+
+
+static NTSTATUS
+LmvGuestCleanup(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    KeWaitForSingleObject(&g_KiSessionGate, Executive, KernelMode, FALSE, nullptr);
+    if (g_KiSessionOwner == IoGetCurrentIrpStackLocation(Irp)->FileObject)
+    {
+        LMV_GUEST_KI_SESSION session = {};
+        NTSTATUS stopped = LmvGuestStopKiSession(&session);
+        if (!NT_SUCCESS(stopped))
+        {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[LMvtdriverGuest] persistent Ki session stop failed; restore VM snapshot.\n");
+            ExAcquireFastMutex(&g_KiDr3EventMutex);
+            g_KiSessionOwner = nullptr;
+            ExReleaseFastMutex(&g_KiDr3EventMutex);
+        }
+    }
+    KeSetEvent(&g_KiSessionGate, IO_NO_INCREMENT, FALSE);
+    ExAcquireFastMutex(&g_KiDr3EventMutex);
+    if (g_KiDr3EventOwner == IoGetCurrentIrpStackLocation(Irp)->FileObject)
+    {
+        InterlockedExchange(&g_KiDr3RaxWriteEnabled, 0);
+        InterlockedExchange(&g_KiDr3HandleEnabled, 0);
+        InterlockedExchange(&g_KiDr3WaitEnabled, 0);
+        g_KiDr3QueueSmokeActive = FALSE;
+        g_KiDr3EventOwner = nullptr;
+        g_KiDr3ControllerProcessId = 0;
+        LmvGuestKiDr3CancelEvents(nullptr);
+        KeSetEvent(&g_KiDr3EventAvailable, IO_NO_INCREMENT, FALSE);
+    }
+    else
+        LmvGuestKiDr3CancelEvents(IoGetCurrentIrpStackLocation(Irp)->FileObject);
+    ExReleaseFastMutex(&g_KiDr3EventMutex);
+    ExAcquireFastMutex(&g_KiMirrorMutex);
+    if (g_KiMirrorAllocation != nullptr &&
+        g_KiMirrorOwner == IoGetCurrentIrpStackLocation(Irp)->FileObject)
+    {
+        LmvGuestReleaseMirrorStorage();
+    }
+    ExReleaseFastMutex(&g_KiMirrorMutex);
+    if (IoGetCurrentIrpStackLocation(Irp)->FileObject == g_ExecProbeFileObject)
+    {
+        LMV_GUEST_EXEC_PROBE probe = {};
+        probe.Operation = LMV_EXEC_PROBE_DISARM;
+        if (NT_SUCCESS(LmvGuestRunExecProbe(&probe, TRUE)))
+            g_ExecProbeFileObject = nullptr;
+        else
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[LMvtdriverGuest] execution probe cleanup failed; revert VM snapshot.\n");
+    }
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+
+// ===== ȱʧ������ʵ�� =====
+
+static NTSTATUS
+LmvGuestStopKiSession(_Inout_ PLMV_GUEST_KI_SESSION Session)
+{
+    UNREFERENCED_PARAMETER(Session);
+    // TODO: ʵ�� KI �Ựֹͣ�߼�
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+LmvGuestRunExecProbe(_Inout_ PLMV_GUEST_EXEC_PROBE Probe, _In_ BOOLEAN FromCleanup)
+{
+    UNREFERENCED_PARAMETER(Probe);
+    UNREFERENCED_PARAMETER(FromCleanup);
+    // TODO: ʵ��ִ��̽���߼�
+    return STATUS_SUCCESS;
+}
+
+static VOID
+LmvGuestStubReset()
+{
+    // TODO: ʵ�ִ�������߼�
+    ExAcquireFastMutex(&g_StubMutex);
+    g_StubQueueHead = 0;
+    g_StubQueueTail = 0;
+    g_StubQueueCount = 0;
+    g_StubActive = FALSE;
+    ExReleaseFastMutex(&g_StubMutex);
+}
+
+static VOID
+LmvGuestReleaseMirrorStorage()
+{
+    // TODO: Implement mirror storage release logic
+    if (g_KiMirrorMdl != nullptr)
+    {
+        MmUnlockPages(g_KiMirrorMdl);
+        IoFreeMdl(g_KiMirrorMdl);
+        g_KiMirrorMdl = nullptr;
+    }
+    if (g_KiMirrorPages != nullptr)
+    {
+        MmUnmapLockedPages(g_KiMirrorPages, g_KiMirrorMdl);
+        g_KiMirrorPages = nullptr;
+    }
+    if (g_KiMirrorAllocation != nullptr)
+    {
+        ExFreePoolWithTag(g_KiMirrorAllocation, 'iMmL');
+        g_KiMirrorAllocation = nullptr;
+    }
+    g_KiMirrorOwner = nullptr;
+}
+
+static VOID
+LmvGuestKiDr3CancelEvents(_In_opt_ PFILE_OBJECT FileObject)
+{
+    // TODO: ʵ�� DR3 �¼�ȡ���߼�
+    for (ULONG i = 0; i < kKiDr3EventCapacity; ++i)
+    {
+        if (FileObject == nullptr || g_KiDr3Events[i].Consumer == FileObject)
+        {
+            if (g_KiDr3Events[i].State != 0)
+            {
+                g_KiDr3Events[i].State = kKiDr3EventCancelled;
+                KeSetEvent(&g_KiDr3Events[i].Completed, IO_NO_INCREMENT, FALSE);
+            }
+            g_KiDr3Events[i].Consumer = nullptr;
+        }
+    }
+}
+
+static NTSTATUS
+LmvGuestCleanupKernelProbe(_In_opt_ PFILE_OBJECT Owner)
+{
+    UNREFERENCED_PARAMETER(Owner);
+    // TODO: ʵ���ں�̽�������߼�
+    g_KernelProbeStage = 0;
+    g_KernelProbeProcessId = 0;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+LmvGuestCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+LmvGuestDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS status = STATUS_NOT_SUPPORTED;
+    ULONG_PTR information = 0;
+    
+    ULONG ioControlCode = stack->Parameters.DeviceIoControl.IoControlCode;
+    PVOID inputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    ULONG inputBufferLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+    PVOID outputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    ULONG outputBufferLength = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    
+    switch (ioControlCode)
+    {
+        case IOCTL_LMV_SET_DEBUG_MODE:
+        {
+            // Set debug mode (Interactive or Transparent)
+            if (inputBufferLength >= sizeof(ULONG))
+            {
+                ULONG mode = *(ULONG*)inputBuffer;
+                
+                // Validate mode
+                if (mode == LMV_DEBUG_MODE_INTERACTIVE || mode == LMV_DEBUG_MODE_TRANSPARENT)
+                {
+                    InterlockedExchange((volatile LONG*)&g_KiSessionMode, mode);
+                    
+                    
+                    // Notify Host driver to update SharedVpData->KiSessionMode via CPUID
+                    LMV_CPUID_RESULT result = {};
+                    LmvGuestCpuidCall(LmvCpuidCommandSyncKiSession, mode, &result);
+                    
+                    if (result.Status != LMV_CPUID_RESULT_SUCCESS)
+                    {
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                   "[LMvtdriverGuest] Failed to sync mode with Host, status=%u\n",
+                                   result.Status);
+                        status = STATUS_UNSUCCESSFUL;
+                        break;
+                    }
+                    
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                               "[LMvtdriverGuest] Debug mode set to %u (%s)\n",
+                               mode,
+                               mode == LMV_DEBUG_MODE_INTERACTIVE ? "Interactive" : "Transparent");
+                    
+                    status = STATUS_SUCCESS;
+                    information = 0;
+                }
+                else
+                {
+                    status = STATUS_INVALID_PARAMETER;
+                }
+            }
+            else
+            {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+        
+        case IOCTL_LMV_QUERY_STATUS:
+        {
+            // Query current status (including current mode)
+            if (outputBufferLength >= sizeof(ULONG) * 2)
+            {
+                ULONG* output = (ULONG*)outputBuffer;
+                output[0] = 1;  // Version
+                output[1] = g_KiSessionMode;  // Current mode
+                
+                status = STATUS_SUCCESS;
+                information = sizeof(ULONG) * 2;
+            }
+            else
+            {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+        
+        
+        case IOCTL_LMV_GUEST_KI_SESSION:
+        {
+            // Handle KI session operations (START, STOP, QUERY, PREPARE_UNLOAD)
+            if (inputBufferLength >= sizeof(LMV_GUEST_KI_SESSION) && 
+                outputBufferLength >= sizeof(LMV_GUEST_KI_SESSION))
+            {
+                PLMV_GUEST_KI_SESSION session = (PLMV_GUEST_KI_SESSION)inputBuffer;
+                
+                // Validate structure
+                if (session->Version != LMV_CPUID_PROTOCOL_VERSION || 
+                    session->Size != sizeof(LMV_GUEST_KI_SESSION))
+                {
+                    status = STATUS_INVALID_PARAMETER;
+                    break;
+                }
+                
+                switch (session->Operation)
+                {
+                    case LMV_KI_SESSION_START:
+                    {
+                        // Start KI debugging session
+                        PEPROCESS process = NULL;
+                        NTSTATUS lookupStatus = PsLookupProcessByProcessId(
+                            ULongToHandle(session->ProcessId), 
+                            &process);
+                        
+                        if (!NT_SUCCESS(lookupStatus) || process == NULL)
+                        {
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                       "[LMvtdriverGuest] PsLookupProcessByProcessId failed for PID=%u, status=0x%08X\n",
+                                       session->ProcessId, lookupStatus);
+                            status = STATUS_INVALID_PARAMETER;
+                            break;
+                        }
+                        
+                        // Get Kernel CR3 from EPROCESS
+                        PUCHAR processBytes = reinterpret_cast<PUCHAR>(process);
+                        ULONGLONG kernelCr3 = *reinterpret_cast<volatile ULONGLONG*>(
+                            processBytes + LMV_KPROCESS_DIRECTORY_TABLE_BASE_OFFSET) & LMV_PAGE_ADDRESS_MASK;
+                        
+                        // Get KiDispatchException address
+                        LMV_GUEST_KI_PAGE_PREFLIGHT preflight = {};
+                        preflight.Version = LMV_CPUID_PROTOCOL_VERSION;
+                        preflight.Size = sizeof(preflight);
+                        
+                        NTSTATUS kiBoundsStatus = LmvGuestFindKiFunctionBounds(&preflight);
+                        ULONGLONG kiAddress = 0;
+                        
+                        if (NT_SUCCESS(kiBoundsStatus) && preflight.RoutineAddress != 0)
+                        {
+                            kiAddress = preflight.RoutineAddress;
+                        }
+                        else
+                        {
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                                       "[LMvtdriverGuest] Failed to find KiDispatchException, status=0x%08X\n",
+                                       kiBoundsStatus);
+                        }
+                        
+                        // Release process reference
+                        ObDereferenceObject(process);
+                        
+                        // Validate that we have valid values
+                        if (kernelCr3 == 0 || kiAddress == 0)
+                        {
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                       "[LMvtdriverGuest] Invalid session parameters: CR3=0x%llX KiAddr=0x%llX\n",
+                                       kernelCr3, kiAddress);
+                            status = STATUS_UNSUCCESSFUL;
+                            break;
+                        }
+                        
+                        // Notify Host driver via CPUID to enable DR3 session
+                        LMV_CPUID_RESULT result = {};
+                        LmvGuestCpuidCall(LmvCpuidCommandSyncKiSession, 1, &result);
+                        
+                        if (result.Status != LMV_CPUID_RESULT_SUCCESS)
+                        {
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                       "[LMvtdriverGuest] Failed to sync KI session with Host, CPUID status=%u\n",
+                                       result.Status);
+                            status = STATUS_UNSUCCESSFUL;
+                            break;
+                        }
+                        
+                        // Fill in session information
+                        session->KernelCr3 = kernelCr3;
+                        session->KiAddress = kiAddress;
+                        session->ProcessorsSeen = 1;
+                        session->ProcessorsExpected = 1;
+                        session->Mode = g_KiSessionMode;
+                        // ProcessId is already set by caller
+                        
+                        status = STATUS_SUCCESS;
+                        information = sizeof(LMV_GUEST_KI_SESSION);
+                        
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                                   "[LMvtdriverGuest] KI session started: PID=%u CR3=0x%llX Ki=0x%llX Mode=%u\n",
+                                   session->ProcessId, kernelCr3, kiAddress, session->Mode);
+                        break;
+                    }
+                    case LMV_KI_SESSION_STOP:
+                    {
+                        // Stop KI debugging session
+                        status = LmvGuestStopKiSession(session);
+                        if (NT_SUCCESS(status))
+                        {
+                            information = sizeof(LMV_GUEST_KI_SESSION);
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                                       "[LMvtdriverGuest] KI session stopped\n");
+                        }
+                        break;
+                    }
+                    
+                    case LMV_KI_SESSION_QUERY:
+                    {
+                        // Query KI session status
+                        session->Mode = g_KiSessionMode;
+                        session->ProcessorsSeen = 1;
+                        session->ProcessorsExpected = 1;
+                        
+                        status = STATUS_SUCCESS;
+                        information = sizeof(LMV_GUEST_KI_SESSION);
+                        break;
+                    }
+                    
+                    case LMV_KI_SESSION_PREPARE_UNLOAD:
+                    {
+                        // Prepare for unload
+                        status = STATUS_SUCCESS;
+                        information = sizeof(LMV_GUEST_KI_SESSION);
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                                   "[LMvtdriverGuest] KI session prepared for unload\n");
+                        break;
+                    }
+                    
+                    default:
+                        status = STATUS_INVALID_PARAMETER;
+                        break;
+                }
+            }
+            else
+            {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+        default:
+            status = STATUS_NOT_SUPPORTED;
+            break;
+    }
+    
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = information;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+static VOID
+LmvGuestUnload(_In_ PDRIVER_OBJECT DriverObject)
+{
+    UNREFERENCED_PARAMETER(DriverObject);
+    LmvGuestStubReset();
+    if (g_KernelProbeStage != 0 && !NT_SUCCESS(LmvGuestCleanupKernelProbe(nullptr)))
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[LMvtdriverGuest] kernel execution probe cleanup failed; revert VM snapshot.\n");
+    if (g_ExecProbeMdl != nullptr)
+    {
+        LMV_GUEST_EXEC_PROBE probe = {};
+        probe.Operation = LMV_EXEC_PROBE_DISARM;
+        if (!NT_SUCCESS(LmvGuestRunExecProbe(&probe, TRUE)))
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[LMvtdriverGuest] execution probe disarm failed; revert VM snapshot.\n");
+    }
+    if (g_KiNxSiteBuffer != nullptr)
+    {
+        ExFreePoolWithTag(g_KiNxSiteBuffer, 'iSmL');
+        g_KiNxSiteBuffer = nullptr;
+    }
+    ExAcquireFastMutex(&g_KiMirrorMutex);
+    if (g_KiMirrorAllocation != nullptr)
+    {
+        LmvGuestReleaseMirrorStorage();
+    }
+    ExReleaseFastMutex(&g_KiMirrorMutex);
+    IoDeleteSymbolicLink(&g_SymbolicLink);
+    IoDeleteSymbolicLink(&g_DebugSymbolicLink);
+    if (g_DeviceObject != nullptr)
+    {
+        IoDeleteDevice(g_DeviceObject);
+        g_DeviceObject = nullptr;
+    }
+    if (g_KiGuestRetired)
+    {
+        LMV_CPUID_RESULT result = {};
+        LmvGuestCpuidCall(LmvCpuidCommandReleaseKiGuest, 0, &result);
+        if (result.Status != LMV_CPUID_RESULT_SUCCESS)
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[LMvtdriverGuest] Host release failed; do not force unload Host.\n");
+    }
+}
+
+
+// ===== ����ļ����õĺ��� =====
+
+extern "C" BOOLEAN
+LmvGuestStaticProbeDecision()
+{
+    // TODO: Implement static probe decision logic
+    return FALSE;
+}
+
+extern "C" VOID
+LmvGuestKiDr3InspectException()
+{
+    // TODO: Implement complete DR3 exception handling logic
+    // 1. Check if target process (g_KiSessionProcess)
+    // 2. Check if user-mode exception
+    // 3. Check if first-chance exception
+    // 4. Package exception event to queue
+    // 5. Decide whether to suspend thread based on g_KiSessionMode:
+    //    - LMV_DEBUG_MODE_INTERACTIVE: suspend thread, wait for R3 debugger
+    //    - LMV_DEBUG_MODE_TRANSPARENT: no suspension, return immediately
+    
+    // Current placeholder implementation, needs refinement based on actual exception handling logic
+    UNREFERENCED_PARAMETER(g_KiSessionMode);
+}
+
+extern "C" VOID
+LmvGuestKiSessionException()
+{
+    // TODO: Implement KI session exception logic
+}
+
+extern "C"
+NTSTATUS
+DriverEntry(
+    _In_ PDRIVER_OBJECT DriverObject,
+    _In_ PUNICODE_STRING RegistryPath
+    )
+{
+    UNREFERENCED_PARAMETER(RegistryPath);
+    UNICODE_STRING deviceName;
+    RtlInitUnicodeString(&deviceName, L"\\Device\\LMvtdriverGuest");
+    RtlInitUnicodeString(&g_SymbolicLink, L"\\DosDevices\\LMvtdriverGuest");
+    RtlInitUnicodeString(&g_DebugSymbolicLink, L"\\DosDevices\\LMdbgsys");
+
+    NTSTATUS status = IoCreateDevice(
+        DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN, FALSE, &g_DeviceObject);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    status = IoCreateSymbolicLink(&g_SymbolicLink, &deviceName);
+    if (!NT_SUCCESS(status))
+    {
+        IoDeleteDevice(g_DeviceObject);
+        g_DeviceObject = nullptr;
+        return status;
+    }
+
+    status = IoCreateSymbolicLink(&g_DebugSymbolicLink, &deviceName);
+    if (!NT_SUCCESS(status))
+    {
+        IoDeleteSymbolicLink(&g_SymbolicLink);
+        IoDeleteDevice(g_DeviceObject);
+        g_DeviceObject = nullptr;
+        return status;
+    }
+
+    ExInitializeFastMutex(&g_CommandMutex);
+    ExInitializeFastMutex(&g_SmokeMutex);
+    ExInitializeFastMutex(&g_KiSiteMutex);
+    ExInitializeFastMutex(&g_KiMirrorMutex);
+    ExInitializeFastMutex(&g_StubMutex);
+    ExInitializeFastMutex(&g_KiDr3EventMutex);
+    KeInitializeEvent(&g_KiSessionGate, SynchronizationEvent, TRUE);
+    g_GuestDriverObject = DriverObject;
+    KeInitializeEvent(&g_StubEventAvailable, NotificationEvent, FALSE);
+    KeInitializeEvent(&g_KiDr3EventAvailable, NotificationEvent, FALSE);
+    for (ULONG index = 0; index < kKiDr3EventCapacity; ++index)
+        KeInitializeEvent(&g_KiDr3Events[index].Completed, NotificationEvent, FALSE);
+    g_StubQueueHead = 0;
+    g_StubQueueTail = 0;
+    g_StubQueueCount = 0;
+    g_StubActive = FALSE;
+    DriverObject->DriverUnload = LmvGuestUnload;
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = LmvGuestCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = LmvGuestCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP] = LmvGuestCleanup;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = LmvGuestDeviceControl;
+    g_DeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+    return STATUS_SUCCESS;
+}

@@ -2,7 +2,7 @@
 #include "debugger.h"
 #include "disasm.h"
 #include "utils.h"
-#include "../../lmv_control_shared.h"
+#include "../../src/shared/lmv_control_shared.h"
 #include <iostream>
 #include <iomanip>
 #include <cstring>
@@ -40,6 +40,7 @@ Debugger::Debugger()
     , m_hEventDevice(INVALID_HANDLE_VALUE)
     , m_driverVersion(0)
     , m_driverFlags(0)
+    , m_debugMode(LMV_DEBUG_MODE_INTERACTIVE)  // Default to interactive mode
 {
 }
 
@@ -181,6 +182,7 @@ bool Debugger::AttachProcess(DWORD pid)
     session.Size = sizeof(session);
     session.Operation = LMV_KI_SESSION_START;
     session.ProcessId = pid;
+    session.Mode = m_debugMode;
     DWORD returned = 0;
     if (!DriverIoctl(IOCTL_LMV_GUEST_KI_SESSION, &session, sizeof(session),
         &session, sizeof(session), &returned)) {
@@ -189,7 +191,7 @@ bool Debugger::AttachProcess(DWORD pid)
         return false;
     }
     if (returned != sizeof(session) || session.Version != LMV_CPUID_PROTOCOL_VERSION ||
-        session.Size != sizeof(session) || session.ProcessId != pid ||
+        session.Size != sizeof(session) || session.ProcessId != pid || session.Mode != m_debugMode ||
         session.KernelCr3 == 0 || session.KiAddress == 0 ||
         session.ProcessorsExpected == 0 || session.ProcessorsSeen != session.ProcessorsExpected) {
         session.Operation = LMV_KI_SESSION_STOP;
@@ -263,6 +265,10 @@ bool Debugger::Detach()
         Breakpoint& bp = kv.second;
         if (bp.type == BreakpointType::Software && bp.enabled) {
             WriteMemory(bp.address, &bp.orig_byte, 1);
+        } else if (bp.type == BreakpointType::Memory && bp.enabled &&
+                   !DisableBreakpoint(bp.id)) {
+            std::cerr << "[!] failed to remove DR2 watchpoint before detach" << std::endl;
+            return false;
         }
     }
     if (m_step_over_bp) {
@@ -749,12 +755,79 @@ uint32_t Debugger::SetHardwareBreakpoint(uint64_t addr, HardwareBreakCondition c
     return 0;
 }
 
+bool Debugger::ControlDr2Watch(ULONG operation, const Breakpoint& breakpoint, uint64_t* hits)
+{
+    if (!m_active || !IsDriverConnected()) {
+        m_last_error = ERROR_INVALID_STATE;
+        return false;
+    }
+
+    LMV_GUEST_DR2_WATCH watch = {};
+    watch.Version = LMV_CPUID_PROTOCOL_VERSION;
+    watch.Size = sizeof(watch);
+    watch.Operation = operation;
+    watch.ProcessId = m_pid;
+    watch.Address = breakpoint.address;
+    watch.Length = static_cast<ULONG>(breakpoint.size);
+    watch.Condition = breakpoint.mem_cond == MemoryBreakCondition::Write ?
+        LMV_DR2_CONDITION_WRITE : LMV_DR2_CONDITION_READ_WRITE;
+    DWORD returned = 0;
+    if (!DriverIoctl(IOCTL_LMV_GUEST_DR2_WATCH, &watch, sizeof(watch),
+        &watch, sizeof(watch), &returned))
+        return false;
+    if (returned != sizeof(watch) || watch.Version != LMV_CPUID_PROTOCOL_VERSION ||
+        watch.Size != sizeof(watch) || watch.Status != ERROR_SUCCESS ||
+        watch.ProcessorsExpected == 0 || watch.ProcessorsSeen != watch.ProcessorsExpected) {
+        m_last_error = ERROR_INVALID_DATA;
+        return false;
+    }
+    if (hits) *hits = watch.Hits;
+    m_last_error = ERROR_SUCCESS;
+    return true;
+}
+
 uint32_t Debugger::SetMemoryBreakpoint(uint64_t addr, uint64_t size,
                                        MemoryBreakCondition cond)
 {
-    std::cerr << "[!] memory breakpoints not supported by driver yet"
+    if (!m_active || m_debugMode != LMV_DEBUG_MODE_TRANSPARENT || addr == 0 ||
+        (addr >> 48) != 0 || (size != 1 && size != 2 && size != 4 && size != 8) ||
+        (addr & (size - 1)) != 0 || addr > 0x00007FFFFFFFFFFFull - (size - 1) ||
+        (cond != MemoryBreakCondition::Write && cond != MemoryBreakCondition::ReadWrite)) {
+        m_last_error = ERROR_INVALID_PARAMETER;
+        std::cerr << "[!] DR2 watchpoints require transparent mode, a canonical user address, "
+                     "an aligned 1/2/4/8-byte range, and Write or ReadWrite condition"
+                  << std::endl;
+        return 0;
+    }
+
+    for (const auto& entry : m_breakpoints) {
+        const Breakpoint& existing = entry.second;
+        if (existing.type != BreakpointType::Memory)
+            continue;
+        if (existing.enabled && existing.address == addr && existing.size == size &&
+            existing.mem_cond == cond)
+            return existing.id;
+        m_last_error = ERROR_BUSY;
+        std::cerr << "[!] DR2 supports one active data watchpoint per session" << std::endl;
+        return 0;
+    }
+
+    Breakpoint breakpoint;
+    breakpoint.id = m_next_bp_id++;
+    breakpoint.type = BreakpointType::Memory;
+    breakpoint.address = addr;
+    breakpoint.size = size;
+    breakpoint.mem_cond = cond;
+    breakpoint.enabled = true;
+    if (!ControlDr2Watch(LMV_DR2_WATCH_START, breakpoint))
+        return 0;
+
+    m_breakpoints[breakpoint.id] = breakpoint;
+    std::cout << "[bp] id=" << breakpoint.id << " DR2 data watch at 0x"
+              << std::hex << addr << " size=" << std::dec << size
+              << (cond == MemoryBreakCondition::Write ? " write" : " read/write")
               << std::endl;
-    return 0;
+    return breakpoint.id;
 }
 
 bool Debugger::RemoveBreakpoint(uint32_t id)
@@ -763,7 +836,11 @@ bool Debugger::RemoveBreakpoint(uint32_t id)
     if (it == m_breakpoints.end()) return false;
     Breakpoint& bp = it->second;
     if (bp.type == BreakpointType::Software && bp.enabled) {
-        WriteMemory(bp.address, &bp.orig_byte, 1);
+        if (!WriteMemory(bp.address, &bp.orig_byte, 1)) return false;
+    } else if (bp.type == BreakpointType::Memory && bp.enabled) {
+        uint64_t hits = 0;
+        if (!ControlDr2Watch(LMV_DR2_WATCH_STOP, bp, &hits)) return false;
+        std::cout << "[bp] DR2 watch removed after " << hits << " hit(s)" << std::endl;
     }
     m_breakpoints.erase(it);
     std::cout << "[bp] id=" << id << " removed" << std::endl;
@@ -781,6 +858,12 @@ bool Debugger::EnableBreakpoint(uint32_t id)
         if (!WriteMemory(bp.address, &cc, 1)) return false;
         bp.enabled = true;
         std::cout << "[bp] id=" << id << " enabled" << std::endl;
+    } else if (bp.type == BreakpointType::Memory) {
+        if (!ControlDr2Watch(LMV_DR2_WATCH_START, bp)) return false;
+        bp.enabled = true;
+        std::cout << "[bp] id=" << id << " DR2 watch enabled" << std::endl;
+    } else {
+        return false;
     }
     return true;
 }
@@ -792,9 +875,17 @@ bool Debugger::DisableBreakpoint(uint32_t id)
     Breakpoint& bp = it->second;
     if (!bp.enabled) return true;
     if (bp.type == BreakpointType::Software) {
-        WriteMemory(bp.address, &bp.orig_byte, 1);
+        if (!WriteMemory(bp.address, &bp.orig_byte, 1)) return false;
         bp.enabled = false;
         std::cout << "[bp] id=" << id << " disabled" << std::endl;
+    } else if (bp.type == BreakpointType::Memory) {
+        uint64_t hits = 0;
+        if (!ControlDr2Watch(LMV_DR2_WATCH_STOP, bp, &hits)) return false;
+        bp.enabled = false;
+        std::cout << "[bp] id=" << id << " DR2 watch disabled after "
+                  << hits << " hit(s)" << std::endl;
+    } else {
+        return false;
     }
     return true;
 }
@@ -933,19 +1024,38 @@ bool Debugger::WriteMemory(uint64_t addr, const void* buf, size_t size)
 std::vector<DisasmInstruction> Debugger::Disassemble(uint64_t addr, int count)
 {
     std::vector<DisasmInstruction> result;
-    if (!m_active) return result;
+    if (!m_active) {
+        std::cerr << "[!] Disassemble: debugger not active" << std::endl;
+        return result;
+    }
     if (count < 1) count = 1;
     if (count > 128) count = 128;
 
     uint64_t cur = addr;
     for (int i = 0; i < count; i++) {
         uint8_t code[16] = {};
-        if (!ReadMemory(cur, code, sizeof(code))) break;
+        if (!ReadMemory(cur, code, sizeof(code))) {
+            std::cerr << "[!] Disassemble: ReadMemory failed at 0x" << std::hex << cur
+                      << " (error " << std::dec << m_last_error << ")" << std::endl;
+            break;
+        }
+
+        // 打印读取的字节用于诊断
+        std::cout << "[disasm] 0x" << std::hex << cur << ": ";
+        for (int j = 0; j < 16; j++) {
+            std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)code[j] << " ";
+        }
+        std::cout << std::dec << std::endl;
+
         DisasmInstruction inst = DisasmOne(cur, code, sizeof(code));
-        if (inst.length <= 0) break;
+        if (inst.length <= 0) {
+            std::cerr << "[!] Disassemble: DisasmOne failed at 0x" << std::hex << cur << std::dec << std::endl;
+            break;
+        }
         result.push_back(inst);
         cur += inst.length;
     }
+    std::cout << "[disasm] Successfully disassembled " << result.size() << " instructions" << std::endl;
     return result;
 }
 
@@ -1027,3 +1137,95 @@ uint64_t Debugger::ResolveSymbol(const std::string& name)
 
 
 
+
+// ========== Debug Mode Control ==========
+bool Dbg_SetDebugMode(ULONG mode) {
+    HANDLE hDevice = CreateFileW(
+        L"\\\\.\\LMvtdriverGuest",
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (hDevice == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    DWORD bytesReturned = 0;
+    BOOL success = DeviceIoControl(
+        hDevice,
+        IOCTL_LMV_SET_DEBUG_MODE,
+        &mode,
+        sizeof(mode),
+        nullptr,
+        0,
+        &bytesReturned,
+        nullptr
+    );
+
+    CloseHandle(hDevice);
+    return success != FALSE;
+}
+
+// ============================================================================
+// Transparent Mode Support
+// ============================================================================
+
+bool Debugger::SetDebugMode(ULONG mode)
+{
+    if (mode != LMV_DEBUG_MODE_INTERACTIVE && mode != LMV_DEBUG_MODE_TRANSPARENT) {
+        std::cerr << "[!] Invalid debug mode: " << mode << std::endl;
+        return false;
+    }
+
+    if (m_active) {
+        m_last_error = ERROR_BUSY;
+        return false;
+    }
+
+    m_debugMode = mode;
+    std::cout << "[+] Debug mode set to "
+              << (mode == LMV_DEBUG_MODE_INTERACTIVE ? "Interactive" : "Transparent")
+              << std::endl;
+    return true;
+}
+
+bool Debugger::PollHostEvents(HOST_EXCEPTION_EVENT& evt)
+{
+    if (m_debugMode != LMV_DEBUG_MODE_TRANSPARENT) {
+        std::cerr << "[!] PollHostEvents only works in transparent mode" << std::endl;
+        return false;
+    }
+
+    DWORD bytesReturned = 0;
+    BOOL success = DeviceIoControl(
+        m_hDevice,
+        IOCTL_LMV_GUEST_POLL_HOST_EVENTS,
+        nullptr,
+        0,
+        &evt,
+        sizeof(HOST_EXCEPTION_EVENT),
+        &bytesReturned,
+        nullptr
+    );
+
+    if (!success) {
+        DWORD err = GetLastError();
+        if (err == ERROR_NO_MORE_ITEMS) {
+            // Queue empty, not an error
+            return false;
+        }
+        std::cerr << "[!] PollHostEvents failed, error " << err << std::endl;
+        return false;
+    }
+
+    if (bytesReturned != sizeof(HOST_EXCEPTION_EVENT)) {
+        std::cerr << "[!] PollHostEvents returned unexpected size: " << bytesReturned << std::endl;
+        return false;
+    }
+
+    return true;
+}
